@@ -1076,3 +1076,62 @@ ready_for_supervised_run равно false.
 
 Workflow предназначен для того, чтобы сделать SEO-решения модели масштабируемыми,
 воспроизводимыми и проверяемыми. Он не отменяет необходимость SEO-контроля.
+
+
+ВОССТАНОВЛЕНИЕ НА ДРУГОМ КОМПЬЮТЕРЕ
+===================================
+
+Этот раздел предполагает, что проект был сохранён в приватном GitHub-репозитории
+без папок files\, outputs\ и jobs\. Исходные семантические ядра и готовые
+отчёты при необходимости переносятся отдельно.
+
+1. Установить Git for Windows, Python и Hermes.
+
+2. В PowerShell клонировать репозиторий:
+
+git clone https://github.com/<YOUR_LOGIN>/<REPOSITORY>.git E:\AI\seo
+cd E:\AI\seo
+
+3. Создать изолированное Python-окружение и установить зависимости:
+
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+Если команда python не найдена, использовать установленную версию Python через
+py, например: py -3.14 -m venv .venv.
+
+4. Проверить окружение:
+
+.\.venv\Scripts\python.exe -c "import sklearn, sentence_transformers; print('Готово')"
+
+5. Восстановить пользовательские slash-команды Hermes. Закрыть Hermes, затем
+выполнить:
+
+Copy-Item -Recurse ".\hermes_customizations\skills\sclear" "C:\Users\<USER>\AppData\Local\hermes\skills\"
+Copy-Item -Recurse ".\hermes_customizations\skills\sknow" "C:\Users\<USER>\AppData\Local\hermes\skills\"
+
+Заменить <USER> именем пользователя Windows. После запуска Hermes открыть
+новый чат. Команды должны появиться как /sclear и /sknow.
+
+6. Если в репозиторий сохранена папка knowledge\, накопленные примеры уже
+восстановлены в knowledge\seo_knowledge.sqlite3. Если эта папка была исключена
+из Git по соображениям конфиденциальности, скопировать её из отдельной резервной
+копии до первого запуска workflow.
+
+7. Положить рабочие файлы семантики в files\ вручную. Они специально не
+хранятся в Git по умолчанию.
+
+8. При необходимости восстановить доработку Hermes для автоматического
+продолжения задач. В папке hermes_customizations\patches\ находятся
+seo_autopilot_stop.py и hermes-seo-autopilot.patch. Патч применять только к
+совместимой версии Hermes после просмотра diff; не копировать целиком личный
+config.yaml, так как он может содержать ключи и настройки провайдеров.
+
+9. Открыть в Hermes проект E:\AI\seo. Для новой задачи использовать:
+
+/sclear <file> <topic>
+
+Для сохранения ручной проверки использовать:
+
+/sknow <reviewed-file.xlsx>
