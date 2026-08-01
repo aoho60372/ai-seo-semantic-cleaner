@@ -3,7 +3,7 @@ WORKFLOW ДЛЯ ОБРАБОТКИ SEO-СЕМАНТИКИ
 
 Расположение проекта:
 
-E:\AI\seo
+Любая локальная папка. Далее она обозначается как <PROJECT_ROOT>.
 
 
 НАЗНАЧЕНИЕ
@@ -29,51 +29,12 @@ Workflow гибридный:
 Python не заменяет модель, а является её вычислительным исполнителем.
 
 
-ПОД КАКОЙ HARNESS РАССЧИТАН ПРОЕКТ
-=================================
-
-Проект рассчитан на LM Studio Bionic в режиме CODE PROJECT.
-
-Необходимая настройка Bionic:
-
-1. Создать или открыть Code Project.
-2. Выбрать E:\AI\seo в качестве рабочей папки.
-3. Использовать модель, которая надёжно выполняет инструкции и умеет вызывать
-   инструменты терминала и файловой системы.
-4. Для каждого отдельного семантического ядра создавать новую сессию Bionic.
-
-Не следует использовать Bionic Work Project для этого workflow.
-
-Причины:
-
-- Code Project имеет доступ к выбранной локальной папке и терминалу;
-- Work Project обычно использует управляемую песочницу для документов;
-- встроенный инструмент Bionic run_python работает в ограниченной среде
-  Pyodide и не видит проектную .venv и установленные ML-библиотеки.
-
-Bionic должна автоматически читать файл AGENTS.md из корня проекта.
-AGENTS.md является основной инструкцией для модели.
-
-В корне проекта разрешены только поддерживаемые Python-файлы:
-
-- seo_workflow.py;
-- seo_prepare.py;
-- seo_pipeline.py;
-- seo_knowledge.py.
-
-Модель не должна создавать check_excel.py, convert_to_csv.py, run_prepare.py,
-*_robust.py или любые другие одноразовые Python-скрипты. Если штатный workflow
-не поддерживает структуру входного файла, модель должна остановиться и сообщить
-точную ошибку. Временные данные разрешены только в jobs\<job>\tmp или
-jobs\<job>\cache.
-
-
 PYTHON-ОКРУЖЕНИЕ
 ================
 
 Интерпретатор проекта:
 
-E:\AI\seo\.venv\Scripts\python.exe
+.\.venv\Scripts\python.exe
 
 Базовая версия Python, на которой создавалась среда:
 
@@ -81,7 +42,7 @@ Python 3.14
 
 Зависимости перечислены в:
 
-E:\AI\seo\requirements.txt
+.\requirements.txt
 
 Основные библиотеки:
 
@@ -114,12 +75,12 @@ GPU намеренно оставлена локальной языковой м
 ЗАПУСК ЧЕРЕЗ HERMES
 ===================
 
-Основной harness для проекта — Hermes. Его терминал настроен на E:\AI\seo,
-а SEO workflow вызывается через PowerShell-обёртку seo.ps1. Начинать задачу
+Основной harness для проекта — Hermes. Открыть <PROJECT_ROOT> как папку
+проекта; SEO workflow вызывается через PowerShell-обёртку seo.ps1. Начинать задачу
 нужно обычным запросом с именем файла и тематикой; Hermes самостоятельно
 вызывает next и получает единственный допустимый следующий шаг.
 
-Подробный короткий протокол находится в HERMES.md. Не нужно вручную запускать
+Подробный короткий протокол находится в AGENTS.md. Не нужно вручную запускать
 Python, pip, Excel-обработчики или читать временные JSON-файлы.
 
 
@@ -133,13 +94,13 @@ Python, pip, Excel-обработчики или читать временные
 
 Для Bionic создан постоянный PowerShell-обёртчик:
 
-E:\AI\seo\seo.ps1
+.\seo.ps1
 
 Из-за особенности Windows PowerShell 5.1 многословные UTF-8 аргументы нельзя
 надёжно передавать ему напрямую через параметр -File из Git Bash. Поэтому
 Bionic вызывает небольшой транспортный мост:
 
-E:\AI\seo\seo-bionic.sh
+.\seo-bionic.sh
 
 Он не выполняет SEO-логику в Bash. Он только сохраняет границы аргументов и
 сразу передаёт управление seo.ps1.
@@ -149,7 +110,7 @@ E:\AI\seo\seo-bionic.sh
 - запускает проектный .venv;
 - устанавливает UTF-8 для PowerShell и Python;
 - отключает лишние progress bars и предупреждения;
-- всегда начинает работу из E:\AI\seo;
+- всегда начинает работу из корня открытого проекта;
 - возвращает Bionic настоящий код завершения workflow.
 
 Все рабочие команды Bionic должны начинаться одинаково:
@@ -177,7 +138,7 @@ E:\AI\seo\seo-bionic.sh
 СТРУКТУРА ПРОЕКТА
 =================
 
-E:\AI\seo\
+<PROJECT_ROOT>\
 
   AGENTS.md
       Постоянная инструкция, которую автоматически читает Bionic.
@@ -292,7 +253,7 @@ Python-скрипты не содержат фиксированных слов�
 
 Пример:
 
-E:\AI\seo\files\auto-parts-july.xlsx
+files\auto-parts-july.xlsx
 
 Исходный файл никогда не должен перезаписываться.
 
@@ -688,7 +649,7 @@ Cleanup не должен удалять:
 
 База:
 
-E:\AI\seo\knowledge\seo_knowledge.sqlite3
+knowledge\seo_knowledge.sqlite3
 
 Просмотр всех тематик:
 
@@ -1023,7 +984,7 @@ ready_for_supervised_run равно false.
 ========================================
 
 1. Открыть LM Studio Bionic.
-2. Открыть Code Project с рабочей папкой E:\AI\seo.
+2. Открыть Code Project с рабочей папкой <PROJECT_ROOT>.
 3. Прочитать README.txt.
 4. Убедиться, что AGENTS.md существует.
 5. Запустить проверку импортов.
@@ -1089,8 +1050,8 @@ Workflow предназначен для того, чтобы сделать SEO
 
 2. В PowerShell клонировать репозиторий:
 
-git clone https://github.com/<YOUR_LOGIN>/<REPOSITORY>.git E:\AI\seo
-cd E:\AI\seo
+git clone https://github.com/<YOUR_LOGIN>/<REPOSITORY>.git seo-workflow
+cd seo-workflow
 
 3. Создать изолированное Python-окружение и установить зависимости:
 
@@ -1108,11 +1069,12 @@ py, например: py -3.14 -m venv .venv.
 5. Восстановить пользовательские slash-команды Hermes. Закрыть Hermes, затем
 выполнить:
 
-Copy-Item -Recurse ".\hermes_customizations\skills\sclear" "C:\Users\<USER>\AppData\Local\hermes\skills\"
-Copy-Item -Recurse ".\hermes_customizations\skills\sknow" "C:\Users\<USER>\AppData\Local\hermes\skills\"
+${hermesSkills} = Join-Path $env:LOCALAPPDATA "hermes\skills"
+Copy-Item -Recurse ".\hermes_customizations\skills\sclear" $hermesSkills
+Copy-Item -Recurse ".\hermes_customizations\skills\sknow" $hermesSkills
 
-Заменить <USER> именем пользователя Windows. После запуска Hermes открыть
-новый чат. Команды должны появиться как /sclear и /sknow.
+После запуска Hermes открыть новый чат. Команды должны появиться как /sclear
+и /sknow.
 
 6. Если в репозиторий сохранена папка knowledge\, накопленные примеры уже
 восстановлены в knowledge\seo_knowledge.sqlite3. Если эта папка была исключена
@@ -1128,7 +1090,7 @@ seo_autopilot_stop.py и hermes-seo-autopilot.patch. Патч применять
 совместимой версии Hermes после просмотра diff; не копировать целиком личный
 config.yaml, так как он может содержать ключи и настройки провайдеров.
 
-9. Открыть в Hermes проект E:\AI\seo. Для новой задачи использовать:
+9. Открыть в Hermes папку <PROJECT_ROOT> как проект. Для новой задачи использовать:
 
 /sclear <file> <topic>
 

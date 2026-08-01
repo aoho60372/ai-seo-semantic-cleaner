@@ -1,7 +1,8 @@
 # Hermes SEO Workflow
 <!-- HERMES_SEO_AUTOPILOT -->
 
-Work only in `E:\AI\seo`.
+Work only in the open project root: the directory that contains this file and
+`seo_workflow.py`.
 
 ## Rule 1 — review import has priority
 

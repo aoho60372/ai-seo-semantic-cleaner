@@ -11,8 +11,8 @@ Interpret the text after `/sclear` as:
 <file> <topic>
 ```
 
-The file is a filename from `E:\AI\seo\files`; the topic is all remaining
-text. A filename containing spaces may be quoted.
+The file is a filename from the open project's `files\` directory; the topic
+is all remaining text. A filename containing spaces may be quoted.
 
 If either value is absent or ambiguous, do not run a command. Return only:
 

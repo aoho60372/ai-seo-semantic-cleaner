@@ -6,7 +6,7 @@ description: Validate and import one reviewed SEO workbook without recalculating
 # Save SEO knowledge
 
 Interpret the text after `/sknow` as exactly one reviewed Excel filename from
-`E:\AI\seo\files`.
+the open project's `files\` directory.
 
 If the filename is absent, contains more than one filename, or is ambiguous,
 do not run a command. Return only:

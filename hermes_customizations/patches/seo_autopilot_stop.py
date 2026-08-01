@@ -1,9 +1,10 @@
 """Bounded stop guard for the local model-driven SEO workflow.
 
-This is deliberately opt-in: it activates only in E:\\AI\\seo when that
-workspace's AGENTS.md carries the explicit marker.  It never runs commands or
-touches data; it only gives Hermes another internal turn when the model tries
-to stop while `seo_workflow next` has recorded an unfinished state.
+This is deliberately opt-in: it activates only in an open project whose
+AGENTS.md carries the explicit marker and which contains the SEO workflow
+entry points. It never runs commands or touches data; it only gives Hermes
+another internal turn when the model tries to stop while `seo_workflow next`
+has recorded an unfinished state.
 """
 
 from __future__ import annotations
@@ -25,7 +26,12 @@ def build_seo_autopilot_nudge(*, attempts: int = 0) -> str | None:
     try:
         root = resolve_agent_cwd().resolve()
         marker_file = root / "AGENTS.md"
-        if root != Path(r"E:\AI\seo") or MARKER not in marker_file.read_text(encoding="utf-8"):
+        if (
+            not marker_file.is_file()
+            or MARKER not in marker_file.read_text(encoding="utf-8")
+            or not (root / "seo_workflow.py").is_file()
+            or not (root / "seo.ps1").is_file()
+        ):
             return None
         states = sorted((root / "jobs").glob("*/state.json"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not states:
