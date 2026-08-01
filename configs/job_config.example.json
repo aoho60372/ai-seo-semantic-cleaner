@@ -1,0 +1,47 @@
+{
+  "job_name": "REPLACE_WITH_UNIQUE_JOB_NAME",
+  "phrase_column": null,
+  "embedding_model": "intfloat/multilingual-e5-small",
+  "topic": {
+    "description": "REPLACE_WITH_THE_USER_SUPPLIED_TOPIC_AND_SCOPE",
+    "relevant_seeds": [
+      "REPLACE_WITH_A_REALISTIC_RELEVANT_QUERY_1",
+      "REPLACE_WITH_A_REALISTIC_RELEVANT_QUERY_2",
+      "REPLACE_WITH_A_REALISTIC_RELEVANT_QUERY_3"
+    ],
+    "garbage_seeds": [
+      "REPLACE_WITH_A_REALISTIC_UNRELATED_QUERY_1",
+      "REPLACE_WITH_A_REALISTIC_UNRELATED_QUERY_2",
+      "REPLACE_WITH_A_REALISTIC_UNRELATED_QUERY_3"
+    ],
+    "positive_markers": [],
+    "garbage_markers": [],
+    "minimum_relevance": 0.35,
+    "garbage_margin": 0.05
+  },
+  "intent": {
+    "commercial_seeds": [
+      "REPLACE_WITH_A_TOPIC_SPECIFIC_COMMERCIAL_QUERY_1",
+      "REPLACE_WITH_A_TOPIC_SPECIFIC_COMMERCIAL_QUERY_2",
+      "REPLACE_WITH_A_TOPIC_SPECIFIC_COMMERCIAL_QUERY_3"
+    ],
+    "informational_seeds": [
+      "REPLACE_WITH_A_TOPIC_SPECIFIC_INFORMATIONAL_QUERY_1",
+      "REPLACE_WITH_A_TOPIC_SPECIFIC_INFORMATIONAL_QUERY_2",
+      "REPLACE_WITH_A_TOPIC_SPECIFIC_INFORMATIONAL_QUERY_3"
+    ],
+    "commercial_markers": [],
+    "informational_markers": [],
+    "semantic_margin": 0.03,
+    "review_margin": 0.04,
+    "default": "commercial"
+  },
+  "clustering": {
+    "batch_size": 64,
+    "n_neighbors": 30,
+    "min_cluster_size": 20,
+    "umap_dimensions": 20,
+    "review_threshold": 0.35
+  },
+  "cluster_stop_words": []
+}

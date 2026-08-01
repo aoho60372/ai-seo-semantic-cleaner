@@ -1,0 +1,22 @@
+# Python and temporary files
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.bak
+
+# Input data and generated reports
+files/
+outputs/
+jobs/
+
+# Secrets and machine-local settings
+.env
+*.token
+config.local.*
+
+# Keep the learned knowledge database only if this repository is private.
+# Uncomment these two lines if you do NOT want to upload accumulated SEO knowledge.
+# knowledge/*.sqlite3
+# knowledge/*.sqlite3-*
