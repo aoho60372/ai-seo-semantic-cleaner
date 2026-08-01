@@ -67,7 +67,11 @@ HIGH_PRIORITY_REVIEW_ROWS = 50
 GARBAGE_SHARE_WARNING = 0.35
 GARBAGE_SHARE_BLOCK = 0.50
 DEFAULT_LARGE_THRESHOLD = 100_000
-HERMES_COMMAND = r"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\seo.ps1"
+# Hermes invokes terminal commands through a Bash-compatible transport before
+# Windows PowerShell receives them.  The quotes preserve the leading backslash:
+# without them Bash turns ``.\seo.ps1`` into ``.seo.ps1`` and PowerShell then
+# reports a misleading, mojibake-prone "file not found" error.
+HERMES_COMMAND = r'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ".\seo.ps1"'
 RUN_LOCK_NAME = ".seo_run.lock.json"
 
 
@@ -578,6 +582,70 @@ def label_summary(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     return labels, phrases
 
 
+def bootstrap_seeds_from_real_labels(job_dir: Path, frame: pd.DataFrame) -> dict[str, int]:
+    """Fill only missing seed slots from model-reviewed, real source phrases.
+
+    Seeds are an aid for the CPU pipeline, not input the user must provide.
+    They must never be invented before the model has seen the semantic core.
+    Existing manually configured values stay first and are never replaced.
+    """
+    config_path = job_dir / "job_config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(config, dict):
+        return {}
+
+    labels, phrases = label_summary(frame)
+
+    def unique_phrases(mask: pd.Series) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for phrase in phrases[mask]:
+            normalized = re.sub(r"\s+", " ", str(phrase).lower().replace("ё", "е")).strip()
+            if normalized and normalized not in seen:
+                result.append(str(phrase).strip())
+                seen.add(normalized)
+        return result
+
+    candidates = {
+        ("topic", "relevant_seeds"): unique_phrases(labels.isin(["commercial", "informational"])),
+        ("intent", "commercial_seeds"): unique_phrases(labels.eq("commercial")),
+        ("intent", "informational_seeds"): unique_phrases(labels.eq("informational")),
+        ("topic", "garbage_seeds"): unique_phrases(labels.eq("garbage")),
+    }
+    changed = False
+    counts: dict[str, int] = {}
+    for (section, key), values in candidates.items():
+        section_data = config.setdefault(section, {})
+        if not isinstance(section_data, dict):
+            continue
+        current = configured_values(config, section, key)
+        seen = {
+            re.sub(r"\s+", " ", value.lower().replace("ё", "е")).strip()
+            for value in current
+        }
+        merged = list(current)
+        for value in values:
+            normalized = re.sub(r"\s+", " ", value.lower().replace("ё", "е")).strip()
+            if normalized not in seen:
+                merged.append(value)
+                seen.add(normalized)
+            if len(merged) >= MIN_SEEDS_PER_CLASS:
+                break
+        if merged != current:
+            section_data[key] = merged
+            changed = True
+        counts[f"{section}.{key}"] = len(merged)
+
+    if changed:
+        temporary = config_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(config_path)
+    return counts
+
+
 def sample_rows(job_dir: Path, offset: int, limit: int, only_unlabeled: bool = True) -> dict[str, object]:
     if offset < 0 or limit < 1 or limit > 25:
         raise ValueError("offset must be non-negative and limit must be from 1 to 25.")
@@ -676,6 +744,7 @@ def apply_label_payload(job_dir: Path, payload: object) -> dict[str, object]:
         frame.to_excel(temporary, sheet_name="Model labels", index=False)
         temporary.replace(job_dir / "model_labels.xlsx")
     labels, _ = label_summary(frame)
+    seed_counts = bootstrap_seeds_from_real_labels(job_dir, frame)
     stage = "active_review" if int(labels.notna().sum()) >= 100 else "initial_labeling"
     state = write_state(
         job_dir,
@@ -689,6 +758,7 @@ def apply_label_payload(job_dir: Path, payload: object) -> dict[str, object]:
         "updated": updated_labels,
         "unchanged": unchanged_labels,
         "applied": applied,
+        "seed_counts": seed_counts,
         "state": state,
     }
 
@@ -1362,7 +1432,10 @@ def main() -> None:
         inspection = json.loads((job_dir / "inspection.json").read_text(encoding="utf-8"))
         workflow_job_id = ensure_workflow_job_id(job_dir)
         write_state(job_dir, "initial_labeling", input=inspection["input_file"], topic=inspection["topic"], workflow_job_id=workflow_job_id, labels_reviewed=0, remaining_review_rows=inspection["sample_rows"])
-        print_result(compact_status(job_status(job_dir)), args.quiet)
+        # The empty seed lists are expected before the first model labels.  Do
+        # not expose readiness checks here: Hermes must receive its first
+        # compact labeling command, not a misleading configuration block.
+        print_result(recorded_next_action(job_dir), args.quiet)
     elif args.command == "status":
         result = job_status(resolve_job(args.job))
         print_result(compact_status(result) if args.compact else result, args.quiet)
