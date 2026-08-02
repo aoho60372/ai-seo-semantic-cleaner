@@ -16,7 +16,9 @@ from agent.runtime_cwd import resolve_agent_cwd
 
 
 MARKER = "HERMES_SEO_AUTOPILOT"
-MAX_NUDGES = 120
+# 50-row batches need fewer than ten nudges even for a dirty core.  A lower
+# bound limits cloud-token damage if a model ignores a terminal workflow state.
+MAX_NUDGES = 30
 
 
 def build_seo_autopilot_nudge(*, attempts: int = 0) -> str | None:
@@ -38,6 +40,8 @@ def build_seo_autopilot_nudge(*, attempts: int = 0) -> str | None:
             return None
         state = json.loads(states[0].read_text(encoding="utf-8"))
         if not isinstance(state, dict) or state.get("autopilot_last_status") != "continue":
+            return None
+        if state.get("run_error") or state.get("blocked_reason"):
             return None
         if state.get("stage") in {"quality_review", "knowledge_saved", "finalized", "learned"}:
             return None

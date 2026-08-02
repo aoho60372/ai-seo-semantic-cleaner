@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import re
 import uuid
@@ -13,6 +14,7 @@ import pandas as pd
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+from seo_io import iter_delimited_chunks, read_delimited_table
 from seo_knowledge import (
     load_balanced_examples,
     load_topic_profile,
@@ -47,8 +49,7 @@ def resolve_input(value: str) -> Path:
 
 def read_table(path: Path, phrase_column: str | None = None) -> tuple[pd.DataFrame, str | int]:
     if path.suffix.lower() in {".csv", ".tsv"}:
-        separator = "\t" if path.suffix.lower() == ".tsv" else None
-        return pd.read_csv(path, sep=separator, engine="python"), 0
+        return read_delimited_table(path), 0
     workbook = pd.ExcelFile(path)
     requested = normalize(phrase_column) if phrase_column else ""
     candidates = {"поисковый запрос", "фраза", "keyword", "query", "запрос"}
@@ -62,6 +63,69 @@ def read_table(path: Path, phrase_column: str | None = None) -> tuple[pd.DataFra
         "No worksheet contains the requested phrase column. "
         f"Available worksheets: {available}. Use --phrase-column if needed."
     )
+
+
+def streaming_csv_candidates(
+    path: Path,
+    phrase_column: str | None,
+    frequency_column: str | None,
+    sample_size: int,
+) -> tuple[pd.DataFrame, str, str | None, dict[str, int]]:
+    """Read a delimited semantic core in chunks and retain a bounded sample only."""
+    header = read_delimited_table(path, nrows=0)
+    phrase_name = choose_phrase_column(header, phrase_column)
+    frequency_name = choose_frequency_column(header, frequency_column)
+    reservoir_size = max(5_000, sample_size * 12)
+    rng = np.random.default_rng(42)
+    reservoir: list[dict[str, object]] = []
+    top: list[tuple[float, int, dict[str, object]]] = []
+    seen_rows = 0
+    non_empty = 0
+    source_rows = 0
+
+    for chunk in iter_delimited_chunks(path, chunksize=50_000):
+        source_rows += len(chunk)
+        raw = chunk[phrase_name].dropna().astype(str).str.strip()
+        raw = raw[raw.ne("")]
+        volumes = (
+            pd.to_numeric(chunk.loc[raw.index, frequency_name], errors="coerce").fillna(0)
+            if frequency_name
+            else pd.Series(0.0, index=raw.index)
+        )
+        for row_index, phrase in raw.items():
+            non_empty += 1
+            seen_rows += 1
+            record = {
+                phrase_name: phrase,
+                "__source_row": int(row_index) + 2,
+                "__volume": float(volumes.loc[row_index]),
+            }
+            if len(reservoir) < reservoir_size:
+                reservoir.append(record)
+            else:
+                replacement = int(rng.integers(0, seen_rows))
+                if replacement < reservoir_size:
+                    reservoir[replacement] = record
+            priority = float(np.log1p(max(record["__volume"], 0)))
+            entry = (priority, seen_rows, record)
+            if len(top) < max(100, sample_size // 5):
+                heapq.heappush(top, entry)
+            elif entry[:2] > top[0][:2]:
+                heapq.heapreplace(top, entry)
+
+    if not reservoir:
+        raise ValueError("The CSV/TSV file has no non-empty phrases.")
+    candidates = pd.DataFrame(reservoir + [entry[2] for entry in top])
+    candidates = candidates.drop_duplicates(subset=[phrase_name], keep="first")
+    if frequency_name:
+        candidates[frequency_name] = candidates["__volume"]
+    candidates = candidates.drop(columns=["__source_row", "__volume"], errors="ignore")
+    return candidates, phrase_name, frequency_name, {
+        "rows_in_source": source_rows,
+        "non_empty_phrases": non_empty,
+        # It is an upper bound, deliberately used to select the safe large path.
+        "unique_phrase_upper_bound": non_empty,
+    }
 
 
 def choose_phrase_column(frame: pd.DataFrame, requested: str | None) -> str:
@@ -146,9 +210,16 @@ def prepare_job(
     prior_limit: int = 150,
 ) -> Path:
     input_path = resolve_input(input_value)
-    source, source_sheet = read_table(input_path, phrase_column)
-    phrase_column = choose_phrase_column(source, phrase_column)
-    frequency_column = choose_frequency_column(source, frequency_column)
+    stream_stats: dict[str, int] | None = None
+    if input_path.suffix.lower() in {".csv", ".tsv"}:
+        source, phrase_column, frequency_column, stream_stats = streaming_csv_candidates(
+            input_path, phrase_column, frequency_column, sample_size
+        )
+        source_sheet: str | int = 0
+    else:
+        source, source_sheet = read_table(input_path, phrase_column)
+        phrase_column = choose_phrase_column(source, phrase_column)
+        frequency_column = choose_frequency_column(source, frequency_column)
 
     raw = source[phrase_column].dropna().astype(str).str.strip()
     raw = raw[raw.ne("")]
@@ -278,17 +349,26 @@ def prepare_job(
         "workflow_job_id": workflow_job_id,
         "topic": topic,
         "input_file": str(input_path),
-        "rows_in_source": int(len(source)),
-        "non_empty_phrases": int(len(raw)),
-        "unique_normalized_phrases": int(len(grouped)),
-        "exact_or_normalized_duplicates": int(len(raw) - len(grouped)),
+        "rows_in_source": (
+            stream_stats["rows_in_source"] if stream_stats else int(len(source))
+        ),
+        "non_empty_phrases": (
+            stream_stats["non_empty_phrases"] if stream_stats else int(len(raw))
+        ),
+        "unique_normalized_phrases": (
+            stream_stats["unique_phrase_upper_bound"] if stream_stats else int(len(grouped))
+        ),
+        "exact_or_normalized_duplicates": (
+            None if stream_stats else int(len(raw) - len(grouped))
+        ),
+        "streaming_prepare": bool(stream_stats),
         "phrase_column": phrase_column,
         "frequency_column": frequency_column,
         "source_sheet": source_sheet,
         "sample_rows": int(len(sample)),
         "prior_knowledge_rows": int(len(prior)),
         "reused_topic_key": reused_topic_key,
-        "next_step": "The model must label model_labels.xlsx and complete job_config.json.",
+        "next_step": "The model must label the compact workflow batches; seeds are derived automatically from real labels.",
     }
     (job_dir / "inspection.json").write_text(
         json.dumps(inspection, ensure_ascii=False, indent=2), encoding="utf-8"

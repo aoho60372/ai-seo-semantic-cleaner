@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import contextlib
 import json
 import logging
@@ -16,6 +17,7 @@ import uuid
 from pathlib import Path
 
 import pandas as pd
+from openpyxl import load_workbook
 from seo_knowledge import (
     forget_topic,
     knowledge_status,
@@ -54,6 +56,7 @@ REQUIRED_RESULT_SHEETS = {
     "Run configuration",
 }
 ALLOWED_ROOT_PYTHON_FILES = {
+    "seo_io.py",
     "seo_knowledge.py",
     "seo_pipeline.py",
     "seo_prepare.py",
@@ -65,7 +68,9 @@ MIN_EXAMPLES_PER_CLASS = 10
 MIN_SEEDS_PER_CLASS = 5
 HIGH_PRIORITY_REVIEW_ROWS = 50
 GARBAGE_SHARE_WARNING = 0.35
-GARBAGE_SHARE_BLOCK = 0.50
+HIGH_GARBAGE_ADDITIONAL_LABELS = 400
+INITIAL_LABEL_BATCH_SIZE = 50
+ACTIVE_REVIEW_BATCH_SIZE = 50
 DEFAULT_LARGE_THRESHOLD = 100_000
 # Hermes invokes terminal commands through a Bash-compatible transport before
 # Windows PowerShell receives them.  The quotes preserve the leading backslash:
@@ -170,10 +175,24 @@ def next_action(job_dir: Path) -> dict[str, object]:
     status = job_status(job_dir)
     state = read_state(job_dir)
     stage = str(state.get("stage", "unknown"))
+    lock_path = job_dir / RUN_LOCK_NAME
+    active_lock = read_run_lock(lock_path) if lock_path.is_file() else {}
+    if active_lock and lock_process_is_active(active_lock):
+        # A run may outlive the terminal tool's foreground timeout.  Returning
+        # a command here would make an agent start a duplicate process or burn
+        # its context on polling an already-running CPU job.
+        return {
+            "status": "running",
+            "stage": "run",
+            "pid": active_lock.get("pid"),
+            "started_at": active_lock.get("started_at"),
+            "instruction": "A workflow run is already active. Do not run, retry, wait, poll, or call next. Return immediately and rely on the terminal completion notification.",
+        }
     inspection = status.get("inspection", {})
     quality = status.get("label_quality", {})
     reviewed = int(quality.get("valid_labeled_rows", 0)) if isinstance(quality, dict) else 0
     total = int(quality.get("sample_rows", 0)) if isinstance(quality, dict) else 0
+    garbage_share = float(quality.get("garbage_share", 0.0)) if isinstance(quality, dict) else 0.0
     errors = list(status.get("blocking_errors", []))
     root_files = list(status.get("unexpected_python_files", []))
     if root_files:
@@ -199,6 +218,13 @@ def next_action(job_dir: Path) -> dict[str, object]:
             "reason": "Reviewed labels and topic knowledge were saved. Do not rerun cleaning unless the user explicitly requests recalculation.",
             "knowledge_topic_key": state.get("knowledge_topic_key"),
         }
+    if stage == "blocked":
+        return {
+            "status": "blocked",
+            "stage": stage,
+            "reason": state.get("run_error") or state.get("blocked_reason") or "The workflow recorded a blocking failure.",
+            "instruction": "Report this block once. Do not retry the same command.",
+        }
     if stage == "finalized":
         return {
             "status": "stop",
@@ -219,7 +245,7 @@ def next_action(job_dir: Path) -> dict[str, object]:
             "stage": "initial_labeling",
             "action": "label_initial_batch",
             "labels_reviewed": reviewed,
-            "command": f'{HERMES_COMMAND} sample --job "{job_dir.name}" --offset 0 --limit {min(25, total - reviewed)} --quiet',
+            "command": f'{HERMES_COMMAND} sample --job "{job_dir.name}" --offset 0 --limit {min(INITIAL_LABEL_BATCH_SIZE, total - reviewed)} --quiet',
             "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
         }
     non_label_errors = [error for error in errors if not error.startswith("Only ") and "Class " not in error and "priority rows" not in error]
@@ -232,13 +258,24 @@ def next_action(job_dir: Path) -> dict[str, object]:
             "blocking_errors": non_label_errors[:5],
             "instruction": "Update only the requested topic-specific fields in job_config.json, then call next again.",
         }
-    if reviewed < min(200, total):
+    normal_target = min(200, total)
+    adaptive_target = (
+        min(HIGH_GARBAGE_ADDITIONAL_LABELS, total)
+        if garbage_share > GARBAGE_SHARE_WARNING
+        else normal_target
+    )
+    if reviewed < adaptive_target:
         return {
             "status": "continue",
             "stage": "active_review",
-            "action": "label_uncertain_batch",
+            "action": (
+                "label_high_garbage_boundary_batch"
+                if adaptive_target > normal_target
+                else "label_uncertain_batch"
+            ),
             "labels_reviewed": reviewed,
-            "command": f'{HERMES_COMMAND} review --job "{job_dir.name}" --limit {min(20, total - reviewed)} --quiet',
+            "target_labels": adaptive_target,
+            "command": f'{HERMES_COMMAND} review --job "{job_dir.name}" --limit {min(ACTIVE_REVIEW_BATCH_SIZE, adaptive_target - reviewed)} --quiet',
             "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
         }
     if not status.get("ready_for_supervised_run", False):
@@ -261,9 +298,10 @@ def recorded_next_action(job_dir: Path) -> dict[str, object]:
     action = next_action(job_dir)
     status = str(action.get("status", "blocked"))
     state = read_state(job_dir)
+    persisted_stage = "run" if status == "running" else str(state.get("stage", action.get("stage", "unknown")))
     write_state(
         job_dir,
-        str(state.get("stage", action.get("stage", "unknown"))),
+        persisted_stage,
         autopilot_last_status=status,
     )
     return action
@@ -410,15 +448,10 @@ def label_quality_status(
             )
 
     garbage_share = counts["garbage"] / max(labeled_count, 1)
-    if garbage_share > GARBAGE_SHARE_BLOCK:
-        errors.append(
-            f"Garbage share in reviewed labels is {garbage_share:.1%}, above the "
-            f"{GARBAGE_SHARE_BLOCK:.0%} safety limit. Recheck false garbage."
-        )
-    elif garbage_share > GARBAGE_SHARE_WARNING:
+    if garbage_share > GARBAGE_SHARE_WARNING:
         warnings.append(
             f"Garbage share in reviewed labels is {garbage_share:.1%}. "
-            "Manually audit false garbage before running."
+            "A dirty semantic core is allowed, but manually audit false garbage before saving knowledge."
         )
 
     positive_markers = configured_values(config, "topic", "positive_markers")
@@ -647,8 +680,8 @@ def bootstrap_seeds_from_real_labels(job_dir: Path, frame: pd.DataFrame) -> dict
 
 
 def sample_rows(job_dir: Path, offset: int, limit: int, only_unlabeled: bool = True) -> dict[str, object]:
-    if offset < 0 or limit < 1 or limit > 25:
-        raise ValueError("offset must be non-negative and limit must be from 1 to 25.")
+    if offset < 0 or limit < 1 or limit > 50:
+        raise ValueError("offset must be non-negative and limit must be from 1 to 50.")
     frame = load_label_sheet(job_dir)
     labels, phrases = label_summary(frame)
     candidates = frame[phrases.ne("") & (labels.isna() if only_unlabeled else pd.Series(True, index=frame.index))].copy()
@@ -774,8 +807,8 @@ def apply_labels(job_dir: Path, source: Path) -> dict[str, object]:
 
 
 def select_active_review(job_dir: Path, limit: int) -> dict[str, object]:
-    if limit < 1 or limit > 25:
-        raise ValueError("limit must be from 1 to 25.")
+    if limit < 1 or limit > 50:
+        raise ValueError("limit must be from 1 to 50.")
     frame = load_label_sheet(job_dir)
     labels, phrases = label_summary(frame)
     labeled = frame[labels.notna() & phrases.ne("")].copy()
@@ -1040,6 +1073,29 @@ def lock_process_is_active(lock_data: dict[str, object]) -> bool:
         return False
     if process_id <= 0:
         return False
+    if os.name == "nt":
+        # Python 3.14 on Windows may turn ``os.kill(pid, 0)`` with access
+        # denied into a SystemError.  Query the process handle directly so a
+        # lock check never breaks `next` while a worker is running.
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(process_query_limited_information, False, process_id)
+        if not handle:
+            error_code = ctypes.get_last_error()
+            # Access denied means that Windows knows the process exists but
+            # this interpreter may not inspect it (for example, an elevated
+            # worker launched by Hermes).
+            return error_code == 5
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(process_id, 0)
     except ProcessLookupError:
@@ -1156,6 +1212,16 @@ def finalize_workbook(
     }
 
 
+def record_run_failure(job_dir: Path, error: Exception) -> None:
+    """Make deterministic pipeline failures terminal for the Hermes autopilot."""
+    write_state(
+        job_dir,
+        "blocked",
+        autopilot_last_status="blocked",
+        run_error=str(error),
+    )
+
+
 def run_with_log(job_dir: Path, input_value: str, output_path: Path | None) -> dict[str, object]:
     lock, existing_lock = acquire_run_lock(job_dir)
     if lock is None:
@@ -1169,6 +1235,14 @@ def run_with_log(job_dir: Path, input_value: str, output_path: Path | None) -> d
     logs.mkdir(parents=True, exist_ok=True)
     log_path = logs / "run.log"
     started = time.perf_counter()
+    write_state(
+        job_dir,
+        "run",
+        autopilot_last_status="running",
+        run_pid=lock["pid"],
+        run_started_at=lock["started_at"],
+        run_mode="standard",
+    )
     try:
         try:
             ensure_workflow_job_id(job_dir)
@@ -1190,7 +1264,8 @@ def run_with_log(job_dir: Path, input_value: str, output_path: Path | None) -> d
             with log_path.open("a", encoding="utf-8") as log:
                 traceback.print_exc(file=log)
             raise
-    except Exception:
+    except Exception as error:
+        record_run_failure(job_dir, error)
         release_run_lock(job_dir, str(lock["token"]))
         raise
     duration = round(time.perf_counter() - started, 3)
@@ -1215,6 +1290,56 @@ def run_with_log(job_dir: Path, input_value: str, output_path: Path | None) -> d
     return result
 
 
+def stage_large_input(job_dir: Path, input_value: str) -> tuple[str, Path | None]:
+    """Create a workflow-owned TSV only when a large XLSX needs streaming.
+
+    The language model never converts user files.  This short-lived staging
+    file contains only the configured phrase and optional frequency columns
+    and is removed by ``run_large_with_log`` in every exit path.
+    """
+    input_path = resolve_input(input_value)
+    if input_path.suffix.lower() in {".csv", ".tsv"}:
+        return str(input_path), None
+    if input_path.suffix.lower() != ".xlsx":
+        raise ValueError("Large mode supports CSV, TSV, and XLSX inputs.")
+    config = json.loads((job_dir / "job_config.json").read_text(encoding="utf-8"))
+    requested_phrase = str(config.get("phrase_column") or "").strip()
+    requested_frequency = str(config.get("frequency_column") or "").strip()
+    sheet_ref = config.get("source_sheet", 0)
+    workbook = load_workbook(input_path, read_only=True, data_only=True)
+    try:
+        sheet = workbook[sheet_ref] if isinstance(sheet_ref, str) else workbook.worksheets[int(sheet_ref)]
+        rows = sheet.iter_rows(values_only=True)
+        header_values = next(rows, None)
+        if not header_values:
+            raise ValueError("The XLSX source sheet has no header row.")
+        headers = ["" if value is None else str(value).strip() for value in header_values]
+        normalized = {re.sub(r"\s+", " ", value.lower()): index for index, value in enumerate(headers)}
+        phrase_index = normalized.get(re.sub(r"\s+", " ", requested_phrase.lower()))
+        if phrase_index is None:
+            raise ValueError(f"Phrase column not found in XLSX staging: {requested_phrase}")
+        frequency_index = normalized.get(re.sub(r"\s+", " ", requested_frequency.lower())) if requested_frequency else None
+        staging = job_dir / "tmp" / f"large-input-{uuid.uuid4().hex}.tsv"
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        with staging.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, delimiter="\t")
+            output_header = [headers[phrase_index]]
+            if frequency_index is not None:
+                output_header.append(headers[frequency_index])
+            writer.writerow(output_header)
+            for values in rows:
+                phrase = values[phrase_index] if phrase_index < len(values) else None
+                if phrase is None or not str(phrase).strip():
+                    continue
+                output_row = [phrase]
+                if frequency_index is not None:
+                    output_row.append(values[frequency_index] if frequency_index < len(values) else "")
+                writer.writerow(output_row)
+        return str(staging), staging
+    finally:
+        workbook.close()
+
+
 def run_large_with_log(job_dir: Path, input_value: str, chunk_size: int) -> dict[str, object]:
     lock, existing_lock = acquire_run_lock(job_dir)
     if lock is None:
@@ -1229,23 +1354,37 @@ def run_large_with_log(job_dir: Path, input_value: str, chunk_size: int) -> dict
     log_path = logs / "run_large.log"
     output_dir = OUTPUT_DIR / job_dir.name / "large" / Path(input_value).stem
     started = time.perf_counter()
+    staged_path: Path | None = None
+    write_state(
+        job_dir,
+        "run",
+        autopilot_last_status="running",
+        run_pid=lock["pid"],
+        run_started_at=lock["started_at"],
+        run_mode="large",
+    )
     try:
         try:
             ensure_workflow_job_id(job_dir)
             from seo_pipeline import run_large_pipeline
 
+            staged_input, staged_path = stage_large_input(job_dir, input_value)
             quiet_library_logs()
             with log_path.open("a", encoding="utf-8") as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
                 print(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] large run started")
-                manifest = run_large_pipeline(input_value, job_dir / "job_config.json", job_dir / "model_labels.xlsx", output_dir, chunk_size)
+                manifest = run_large_pipeline(staged_input, job_dir / "job_config.json", job_dir / "model_labels.xlsx", output_dir, chunk_size, source_name=Path(input_value).name)
                 print(f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] large run completed")
         except Exception:
             with log_path.open("a", encoding="utf-8") as log:
                 traceback.print_exc(file=log)
             raise
-    except Exception:
+    except Exception as error:
+        record_run_failure(job_dir, error)
         release_run_lock(job_dir, str(lock["token"]))
         raise
+    finally:
+        if staged_path and staged_path.is_file():
+            staged_path.unlink()
     duration = round(time.perf_counter() - started, 3)
     state = write_state(job_dir, "quality_review", last_large_run=manifest["excel_summary"], duration_seconds=duration)
     result = {"status": "completed", "output": manifest["excel_summary"], "rows": manifest["classified_rows_per_chunk_deduplicated"], "duration_seconds": duration, "log": str(log_path.resolve()), "stage": state["stage"]}
@@ -1267,10 +1406,10 @@ def run_auto(job_dir: Path, input_value: str, threshold: int, chunk_size: int) -
         result["mode"] = "standard"
         result["large_threshold"] = threshold
         return result
-    if input_path.suffix.lower() not in {".csv", ".tsv"}:
+    if input_path.suffix.lower() not in {".csv", ".tsv", ".xlsx"}:
         raise ValueError(
-            f"run-auto selected large mode for {rows} unique phrases (threshold {threshold}), "
-            "but large mode requires CSV or TSV. Export the input to files\\ and run run-auto again."
+            f"run-auto selected large mode for {rows} phrases, but the input format "
+            f"{input_path.suffix or '<none>'} is unsupported. Use CSV, TSV, or XLSX."
         )
     result = run_large_with_log(job_dir, input_value, chunk_size)
     result["mode"] = "large"

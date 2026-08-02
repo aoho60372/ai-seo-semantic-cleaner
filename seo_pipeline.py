@@ -18,6 +18,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 
+from seo_io import iter_delimited_chunks, read_delimited_table
 
 PROJECT_DIR = Path(__file__).resolve().parent
 INPUT_DIR = PROJECT_DIR / "files"
@@ -45,8 +46,7 @@ def normalize(value: object) -> str:
 
 def read_table(path: Path, sheet_name: str | int = 0) -> pd.DataFrame:
     if path.suffix.lower() in {".csv", ".tsv"}:
-        separator = "\t" if path.suffix.lower() == ".tsv" else None
-        return pd.read_csv(path, sep=separator, engine="python")
+        return read_delimited_table(path)
     return pd.read_excel(path, sheet_name=sheet_name)
 
 
@@ -625,6 +625,7 @@ def run_large_pipeline(
     labels_path: Path,
     output_dir: Path,
     chunk_size: int = 50000,
+    source_name: str | None = None,
 ) -> dict[str, Any]:
     """Chunked CPU classification plus sample-based centroid clustering for CSV/TSV inputs."""
     from sentence_transformers import SentenceTransformer
@@ -638,8 +639,7 @@ def run_large_pipeline(
     output_dir.mkdir(parents=True, exist_ok=True)
     parts_dir = output_dir / "parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
-    separator = "\t" if input_path.suffix.lower() == ".tsv" else None
-    header = pd.read_csv(input_path, sep=separator, engine="python", nrows=0)
+    header = read_delimited_table(input_path, nrows=0)
     phrase_column = choose_phrase_column(header, config.get("phrase_column"))
     frequency_column = config.get("frequency_column")
     if frequency_column not in header.columns:
@@ -652,7 +652,7 @@ def run_large_pipeline(
     total_rows = 0
     representatives: dict[str, list[pd.DataFrame]] = {"commercial": [], "informational": []}
     use_columns = [phrase_column] + ([frequency_column] if frequency_column else [])
-    reader = pd.read_csv(input_path, sep=separator, engine="python", usecols=use_columns, chunksize=chunk_size)
+    reader = iter_delimited_chunks(input_path, chunksize=chunk_size, usecols=use_columns)
     for part_number, chunk in enumerate(reader, start=1):
         raw = chunk[phrase_column].dropna().astype(str).str.strip()
         raw = raw[raw.ne("")]
@@ -740,11 +740,12 @@ def run_large_pipeline(
     uncertain_frame.to_csv(uncertain_path, index=False, encoding="utf-8")
     summary_path = output_dir / "cluster_summary.csv"
     summary.to_csv(summary_path, index=False, encoding="utf-8")
-    report_path = output_dir / f"{input_path.stem}_LARGE_SUMMARY.xlsx"
+    source_stem = Path(source_name).stem if source_name else input_path.stem
+    report_path = output_dir / f"{source_stem}_LARGE_SUMMARY.xlsx"
     manifest = {
         "status": "completed",
         "workflow_job_id": config.get("workflow_job_id", ""),
-        "input": str(input_path.resolve()),
+        "input": source_name or str(input_path.resolve()),
         "format": "partitioned_csv_gzip",
         "parts_directory": str(parts_dir.resolve()),
         "parts": len(list(parts_dir.glob("part-*.csv.gz"))),
