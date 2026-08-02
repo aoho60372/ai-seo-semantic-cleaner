@@ -11,7 +11,10 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.linear_model import LogisticRegression
@@ -24,6 +27,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 INPUT_DIR = PROJECT_DIR / "files"
 OUTPUT_DIR = PROJECT_DIR / "outputs"
 VALID_LABELS = {"commercial", "informational", "garbage"}
+EXCEL_MAX_DATA_ROWS = 1_048_575
 LABEL_ALIASES = {
     "коммерческий": "commercial",
     "коммерческие": "commercial",
@@ -619,6 +623,130 @@ def stable_sample_mask(values: pd.Series, divisor: int = 40) -> np.ndarray:
     )
 
 
+def _excel_value(value: object) -> object:
+    """Convert pandas missing values to cells that Excel can store."""
+    return None if pd.isna(value) else value
+
+
+def export_large_result_workbook(
+    parts_dir: Path,
+    report_path: Path,
+    cluster_summary: pd.DataFrame,
+    uncertain_review: pd.DataFrame,
+    config: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, int]:
+    """Create the same review workbook contract as the standard pipeline.
+
+    Classified rows are streamed from the compressed parts, so exporting a
+    large core does not require loading the whole result into RAM.  Excel has a
+    hard per-sheet row limit; exceptionally large intent groups continue on
+    numbered sheets while preserving the familiar first-sheet names.
+    """
+    parts = sorted(parts_dir.glob("part-*.csv.gz"))
+    if not parts:
+        raise FileNotFoundError(f"No classified parts found in {parts_dir}")
+    columns = list(pd.read_csv(parts[0], compression="gzip", nrows=0).columns)
+    workbook = Workbook(write_only=True)
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    sheet_states: dict[str, tuple[object, int, int]] = {}
+    total_by_intent = {"commercial": 0, "informational": 0, "garbage": 0}
+    sheet_names = {
+        "commercial": "Commercial clusters",
+        "informational": "Informational clusters",
+        "garbage": "Garbage",
+    }
+
+    def create_sheet(base_name: str, part_number: int, headers: list[str]) -> object:
+        title = base_name if part_number == 1 else f"{base_name} {part_number}"
+        sheet = workbook.create_sheet(title)
+        header_cells = []
+        for header in headers:
+            cell = WriteOnlyCell(sheet, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            header_cells.append(cell)
+        sheet.append(header_cells)
+        sheet.freeze_panes = "A2"
+        for index, header in enumerate(headers, start=1):
+            sheet.column_dimensions[get_column_letter(index)].width = min(max(len(header) + 2, 14), 42)
+        return sheet
+
+    def target_sheet(intent: str) -> tuple[object, int, int]:
+        state = sheet_states.get(intent)
+        if state is None or state[1] >= EXCEL_MAX_DATA_ROWS:
+            part_number = 1 if state is None else state[2] + 1
+            state = (create_sheet(sheet_names[intent], part_number, columns), 0, part_number)
+            sheet_states[intent] = state
+        return state
+
+    for part in parts:
+        frame = pd.read_csv(part, compression="gzip")
+        for intent in total_by_intent:
+            subset = frame[frame["Intent"].eq(intent)]
+            if subset.empty:
+                continue
+            for row in subset[columns].itertuples(index=False, name=None):
+                sheet, written, sheet_number = target_sheet(intent)
+                sheet.append([_excel_value(value) for value in row])
+                sheet_states[intent] = (sheet, written + 1, sheet_number)
+                total_by_intent[intent] += 1
+
+    for intent in total_by_intent:
+        if intent not in sheet_states:
+            sheet_states[intent] = (create_sheet(sheet_names[intent], 1, columns), 0, 1)
+
+    review = uncertain_review.copy()
+    for column in ("Correct Intent", "Correct Cluster", "Reviewer Notes"):
+        if column not in review.columns:
+            review[column] = ""
+    review_columns = list(review.columns)
+
+    def append_small_sheet(name: str, frame: pd.DataFrame) -> None:
+        sheet = create_sheet(name, 1, list(frame.columns))
+        for row in frame.itertuples(index=False, name=None):
+            sheet.append([_excel_value(value) for value in row])
+        sheet.auto_filter.ref = f"A1:{get_column_letter(max(len(frame.columns), 1))}{len(frame) + 1}"
+
+    append_small_sheet("Cluster review", cluster_summary)
+    append_small_sheet("Human review", review[review_columns])
+    quality = pd.DataFrame(
+        [
+            ("Job", config.get("job_name", "")),
+            ("Workflow Job ID", config.get("workflow_job_id", "")),
+            ("Topic", config.get("topic", {}).get("description", "")),
+            ("Input file", metadata.get("input", "")),
+            ("Execution device", "CPU"),
+            ("Processing mode", "Large / streamed"),
+            ("Unique phrases", metadata.get("classified_rows_per_chunk_deduplicated", 0)),
+            ("Commercial phrases", total_by_intent["commercial"]),
+            ("Informational phrases", total_by_intent["informational"]),
+            ("Garbage phrases", total_by_intent["garbage"]),
+            ("Human review candidates", len(review)),
+        ],
+        columns=["Metric", "Value"],
+    )
+    append_small_sheet("Quality report", quality)
+    validation = pd.DataFrame(
+        [
+            ("Classifier", "LogisticRegression trained on model-reviewed labels"),
+            ("Clustering", metadata.get("clustering", "")),
+            ("Parts", metadata.get("parts", len(parts))),
+        ],
+        columns=["Metric", "Value"],
+    )
+    append_small_sheet("Validation metrics", validation)
+    append_small_sheet("Run configuration", pd.DataFrame(flatten_config(config), columns=["Parameter", "Value"]))
+
+    for intent, (sheet, written, _) in sheet_states.items():
+        sheet.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{written + 1}"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(report_path)
+    return total_by_intent
+
+
 def run_large_pipeline(
     input_value: str,
     config_path: Path,
@@ -737,11 +865,13 @@ def run_large_pipeline(
         summary = summary.groupby(["Intent", "Cluster"], dropna=False).agg(Phrases=("Phrases", "sum"), Total_Search_Volume=("Total_Search_Volume", "sum"), Average_Confidence=("Average_Confidence", "mean")).reset_index().sort_values("Total_Search_Volume", ascending=False)
     uncertain_frame = pd.concat(uncertain, ignore_index=True).nsmallest(1000, "Classification confidence") if uncertain else pd.DataFrame()
     uncertain_path = output_dir / "uncertain_review.csv"
-    uncertain_frame.to_csv(uncertain_path, index=False, encoding="utf-8")
+    # These two exports are intended for people as well as scripts.  The BOM
+    # lets desktop Excel on Windows recognise Russian UTF-8 text correctly.
+    uncertain_frame.to_csv(uncertain_path, index=False, encoding="utf-8-sig")
     summary_path = output_dir / "cluster_summary.csv"
-    summary.to_csv(summary_path, index=False, encoding="utf-8")
+    summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
     source_stem = Path(source_name).stem if source_name else input_path.stem
-    report_path = output_dir / f"{source_stem}_LARGE_SUMMARY.xlsx"
+    report_path = output_dir / f"{source_stem}_clustered.xlsx"
     manifest = {
         "status": "completed",
         "workflow_job_id": config.get("workflow_job_id", ""),
@@ -754,13 +884,13 @@ def run_large_pipeline(
         "clustering": "MiniBatchKMeans on deterministic representative samples; all rows assigned to nearest sample centroid.",
         "uncertain_review": str(uncertain_path.resolve()),
         "cluster_summary": str(summary_path.resolve()),
+        "excel_result": str(report_path.resolve()),
+        # Kept for compatibility with existing workflow state readers.
         "excel_summary": str(report_path.resolve()),
     }
-    with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
-        pd.DataFrame(list(manifest.items()), columns=["Metric", "Value"]).to_excel(writer, sheet_name="Large run report", index=False)
-        summary.head(5000).to_excel(writer, sheet_name="Cluster summary", index=False)
-        uncertain_frame.head(1000).to_excel(writer, sheet_name="Uncertain review", index=False)
-        style_workbook(writer)
+    manifest["intent_counts"] = export_large_result_workbook(
+        parts_dir, report_path, summary, uncertain_frame, config, manifest
+    )
     (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
 

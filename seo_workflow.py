@@ -1417,6 +1417,46 @@ def run_auto(job_dir: Path, input_value: str, threshold: int, chunk_size: int) -
     return result
 
 
+def export_completed_large_result(job_dir: Path, input_value: str) -> dict[str, object]:
+    """Build the human review workbook from an already completed large run.
+
+    This deliberately reads only the classified part files.  It never starts
+    embeddings, classification, or clustering again.
+    """
+    input_path = resolve_input(input_value)
+    output_dir = OUTPUT_DIR / job_dir.name / "large" / input_path.stem
+    manifest_path = output_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Completed large-run manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("status") != "completed":
+        raise ValueError("Large run is not completed; export was not started.")
+    parts_dir = output_dir / "parts"
+    if not list(parts_dir.glob("part-*.csv.gz")):
+        raise FileNotFoundError("Completed large-run parts are missing.")
+    from seo_pipeline import export_large_result_workbook
+
+    summary_path = output_dir / "cluster_summary.csv"
+    uncertain_path = output_dir / "uncertain_review.csv"
+    summary = pd.read_csv(summary_path, encoding="utf-8-sig") if summary_path.is_file() else pd.DataFrame()
+    uncertain = pd.read_csv(uncertain_path, encoding="utf-8-sig") if uncertain_path.is_file() else pd.DataFrame()
+    config = json.loads((job_dir / "job_config.json").read_text(encoding="utf-8"))
+    result_path = output_dir / f"{input_path.stem}_clustered.xlsx"
+    counts = export_large_result_workbook(parts_dir, result_path, summary, uncertain, config, manifest)
+    manifest["excel_result"] = str(result_path.resolve())
+    manifest["excel_summary"] = str(result_path.resolve())
+    manifest["intent_counts"] = counts
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_state(job_dir, "quality_review", last_large_run=str(result_path.resolve()))
+    return {
+        "status": "completed",
+        "recalculated": False,
+        "output": str(result_path.resolve()),
+        "rows": int(manifest.get("classified_rows_per_chunk_deduplicated", 0)),
+        "intent_counts": counts,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Orchestrate the model-directed SEO workflow.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1487,6 +1527,13 @@ def main() -> None:
     run_auto_parser.add_argument("--large-threshold", type=int, default=DEFAULT_LARGE_THRESHOLD)
     run_auto_parser.add_argument("--chunk-size", type=int, default=50000)
     run_auto_parser.add_argument("--quiet", action="store_true")
+
+    export_large = subparsers.add_parser(
+        "export-large", help="Create the full review workbook from completed large-run parts without recalculation."
+    )
+    export_large.add_argument("input")
+    export_large.add_argument("--job", required=True)
+    export_large.add_argument("--quiet", action="store_true")
 
     finalize = subparsers.add_parser(
         "finalize",
@@ -1644,6 +1691,8 @@ def main() -> None:
                 "Job is not ready for a supervised run. Fix these blocking errors:\n- " + details
             )
         print_result(run_auto(job_dir, args.input, args.large_threshold, args.chunk_size), args.quiet)
+    elif args.command == "export-large":
+        print_result(export_completed_large_result(resolve_job(args.job), args.input), args.quiet)
     elif args.command == "finalize":
         job_dir = resolve_job(args.job)
         result = finalize_workbook(job_dir, args.input, args.source)
