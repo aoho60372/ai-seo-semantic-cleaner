@@ -40,7 +40,7 @@ Then repeat until the returned JSON has `status` `stop`, `blocked`, or
 
 Do not ask the user to continue and do not send progress messages between steps.
 
-## Long CPU runs
+## Long compute runs
 
 `run`, `run-auto`, and `run-large` may take longer than the terminal's
 foreground timeout. This timeout does **not** mean that the workflow failed.
@@ -54,6 +54,10 @@ If `next` returns `{"status":"running", ...}`, a workflow process is
 already active. Do not retry it, do not poll it, and do not wait in a loop.
 End the turn immediately. Only a terminal completion notification may resume
 the workflow. A non-run tool error may be handled by calling `next` once.
+
+The workflow uses only the project-local `../models/multilingual-e5-small`
+embedding model. Never download or replace it during a task. It selects CUDA
+automatically when the installed PyTorch can use an NVIDIA GPU, otherwise CPU.
 
 ## Command safety
 

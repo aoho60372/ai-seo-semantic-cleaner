@@ -1,7 +1,10 @@
 {
   "job_name": "REPLACE_WITH_UNIQUE_JOB_NAME",
   "phrase_column": null,
-  "embedding_model": "intfloat/multilingual-e5-small",
+  "embedding_model": "local:multilingual-e5-small",
+  "embedding_device": "auto",
+  "embedding_batch_size": 256,
+  "embedding_prefix": "query: ",
   "topic": {
     "description": "REPLACE_WITH_THE_USER_SUPPLIED_TOPIC_AND_SCOPE",
     "relevant_seeds": [
@@ -37,7 +40,7 @@
     "default": "commercial"
   },
   "clustering": {
-    "batch_size": 64,
+    "batch_size": 256,
     "n_neighbors": 30,
     "min_cluster_size": 20,
     "umap_dimensions": 20,

@@ -21,6 +21,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 
+from seo_embeddings import encode_queries, load_local_embedding_model
 from seo_io import iter_delimited_chunks, read_delimited_table
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -156,12 +157,7 @@ def seed_scores(
 ) -> np.ndarray:
     if not seeds:
         return np.zeros(len(vectors), dtype=float)
-    seed_vectors = model.encode(
-        [f"passage: {normalize(seed)}" for seed in seeds],
-        batch_size=batch_size,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
+    seed_vectors = encode_queries(model, [normalize(seed) for seed in seeds], batch_size)
     return np.max(vectors @ np.asarray(seed_vectors).T, axis=1)
 
 
@@ -248,14 +244,7 @@ def supervised_classification(
             "Garbage is optional and must never be invented."
         )
 
-    train_vectors = np.asarray(
-        model.encode(
-            [f"passage: {value}" for value in labels["Normalized"]],
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-    )
+    train_vectors = encode_queries(model, labels["Normalized"], batch_size)
     train_labels = labels["Label"].to_numpy()
     validation_rows: list[tuple[str, Any]] = [
         ("Mode", "Supervised model labels"),
@@ -470,26 +459,14 @@ def run_pipeline(
     labels_path: Path | None,
     output_path: Path | None,
 ) -> Path:
-    # Torch and sentence-transformers are intentionally initialized only for
-    # a real CPU classification run, never while the agent is labelling.
-    from sentence_transformers import SentenceTransformer
-
     input_path = resolve_input(input_value)
     config = load_config(config_path)
     source = read_table(input_path, config.get("source_sheet", 0))
     phrase_column = choose_phrase_column(source, config.get("phrase_column"))
     phrase_table = build_phrase_table(source, phrase_column, config.get("frequency_column"))
-    batch_size = int(config["clustering"].get("batch_size", 64))
-    embedding_model = str(config.get("embedding_model", "intfloat/multilingual-e5-small"))
-    model = SentenceTransformer(embedding_model, device="cpu")
-    vectors = np.asarray(
-        model.encode(
-            [f"passage: {text}" for text in phrase_table["Normalized"]],
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-    )
+    batch_size = int(config.get("embedding_batch_size", config["clustering"].get("batch_size", 256)))
+    model, execution_device, model_path = load_local_embedding_model(config)
+    vectors = encode_queries(model, phrase_table["Normalized"], batch_size, str(config.get("embedding_prefix", "query: ")))
 
     model_labels = load_model_labels(labels_path)
     try:
@@ -555,8 +532,8 @@ def run_pipeline(
             ("Workflow Job ID", config.get("workflow_job_id", "")),
             ("Topic", config["topic"].get("description", "")),
             ("Input file", input_path.name),
-            ("Execution device", "CPU"),
-            ("Embedding model", embedding_model),
+            ("Execution device", execution_device),
+            ("Embedding model", str(model_path)),
             ("Unique phrases", len(phrase_table)),
             ("Commercial phrases", len(intent_frames["Commercial clusters"])),
             ("Informational phrases", len(intent_frames["Informational clusters"])),
@@ -600,14 +577,7 @@ def fit_large_classifier(
         raise ValueError(
             "run-large requires at least 30 real model labels, including commercial and informational."
         )
-    vectors = np.asarray(
-        model.encode(
-            [f"passage: {text}" for text in labels["Normalized"]],
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-    )
+    vectors = encode_queries(model, labels["Normalized"], batch_size)
     return LogisticRegression(max_iter=2000, class_weight="balanced", random_state=42).fit(
         vectors, labels["Label"].to_numpy()
     )
@@ -718,7 +688,7 @@ def export_large_result_workbook(
             ("Workflow Job ID", config.get("workflow_job_id", "")),
             ("Topic", config.get("topic", {}).get("description", "")),
             ("Input file", metadata.get("input", "")),
-            ("Execution device", "CPU"),
+            ("Execution device", metadata.get("execution_device", "CPU")),
             ("Processing mode", "Large / streamed"),
             ("Unique phrases", metadata.get("classified_rows_per_chunk_deduplicated", 0)),
             ("Commercial phrases", total_by_intent["commercial"]),
@@ -755,8 +725,7 @@ def run_large_pipeline(
     chunk_size: int = 50000,
     source_name: str | None = None,
 ) -> dict[str, Any]:
-    """Chunked CPU classification plus sample-based centroid clustering for CSV/TSV inputs."""
-    from sentence_transformers import SentenceTransformer
+    """Chunked classification plus sample-based centroid clustering for large cores."""
 
     input_path = resolve_input(input_value)
     if input_path.suffix.lower() not in {".csv", ".tsv"}:
@@ -772,8 +741,14 @@ def run_large_pipeline(
     frequency_column = config.get("frequency_column")
     if frequency_column not in header.columns:
         frequency_column = None
-    batch_size = int(config["clustering"].get("batch_size", 64))
-    model = SentenceTransformer(str(config.get("embedding_model", "intfloat/multilingual-e5-small")), device="cpu")
+    batch_size = int(config.get("embedding_batch_size", config["clustering"].get("batch_size", 256)))
+    model, execution_device, model_path = load_local_embedding_model(config)
+    embedding_prefix = str(config.get("embedding_prefix", "query: "))
+    cache_dir = output_dir / ".embedding-cache"
+    if cache_dir.exists():
+        import shutil
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     classifier = fit_large_classifier(load_model_labels(labels_path), model, batch_size)
     classes = classifier.classes_
     class_index = {label: index for index, label in enumerate(classes)}
@@ -793,7 +768,8 @@ def run_large_pipeline(
         table = table.drop_duplicates("Normalized", keep="first")
         if table.empty:
             continue
-        vectors = np.asarray(model.encode([f"passage: {text}" for text in table["Normalized"]], batch_size=batch_size, normalize_embeddings=True, show_progress_bar=False))
+        vectors = encode_queries(model, table["Normalized"], batch_size, embedding_prefix)
+        np.save(cache_dir / f"part-{part_number:06d}.npy", vectors)
         probabilities = classifier.predict_proba(vectors)
         prediction = classes[np.argmax(probabilities, axis=1)]
         table["Intent"] = prediction
@@ -817,7 +793,7 @@ def run_large_pipeline(
         sample = pd.concat(samples, ignore_index=True).drop_duplicates("Normalized").head(10000) if samples else pd.DataFrame()
         if len(sample) < 8:
             continue
-        vectors = np.asarray(model.encode([f"passage: {text}" for text in sample["Normalized"]], batch_size=batch_size, normalize_embeddings=True, show_progress_bar=False))
+        vectors = encode_queries(model, sample["Normalized"], batch_size, embedding_prefix)
         cluster_count = min(max(2, int(np.sqrt(len(sample) / 2))), 80, len(sample))
         fitted = MiniBatchKMeans(n_clusters=cluster_count, random_state=42, batch_size=min(2048, len(sample)), n_init="auto").fit(vectors)
         names = cluster_labels(sample["Phrase"].tolist(), fitted.labels_, config.get("cluster_stop_words", []))
@@ -834,13 +810,14 @@ def run_large_pipeline(
     summaries: list[dict[str, Any]] = []
     for part in sorted(parts_dir.glob("part-*.csv.gz")):
         frame = pd.read_csv(part, compression="gzip")
-        vectors = None
+        cache_path = cache_dir / f"{part.stem.replace('.csv', '')}.npy"
+        vectors = np.load(cache_path, mmap_mode="r") if cache_path.is_file() else None
         for intent, (centroid_vectors, names) in centroids.items():
             mask = frame["Intent"].eq(intent)
             if not mask.any():
                 continue
             if vectors is None:
-                vectors = np.asarray(model.encode([f"passage: {text}" for text in frame["Normalized"]], batch_size=batch_size, normalize_embeddings=True, show_progress_bar=False))
+                vectors = encode_queries(model, frame["Normalized"], batch_size, embedding_prefix)
             similarity = vectors[mask.to_numpy()] @ centroid_vectors.T
             indexes = np.argmax(similarity, axis=1)
             frame.loc[mask, "Cluster"] = [names[index] for index in indexes]
@@ -881,6 +858,9 @@ def run_large_pipeline(
         "parts": len(list(parts_dir.glob("part-*.csv.gz"))),
         "classified_rows_per_chunk_deduplicated": total_rows,
         "chunk_size": chunk_size,
+        "embedding_model": str(model_path),
+        "execution_device": execution_device,
+        "embedding_batch_size": batch_size,
         "clustering": "MiniBatchKMeans on deterministic representative samples; all rows assigned to nearest sample centroid.",
         "uncertain_review": str(uncertain_path.resolve()),
         "cluster_summary": str(summary_path.resolve()),
@@ -892,6 +872,8 @@ def run_large_pipeline(
         parts_dir, report_path, summary, uncertain_frame, config, manifest
     )
     (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    import shutil
+    shutil.rmtree(cache_dir, ignore_errors=True)
     return manifest
 
 

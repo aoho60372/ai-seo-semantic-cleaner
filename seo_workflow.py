@@ -57,6 +57,7 @@ REQUIRED_RESULT_SHEETS = {
 }
 ALLOWED_ROOT_PYTHON_FILES = {
     "seo_io.py",
+    "seo_embeddings.py",
     "seo_knowledge.py",
     "seo_pipeline.py",
     "seo_prepare.py",
@@ -81,7 +82,7 @@ RUN_LOCK_NAME = ".seo_run.lock.json"
 
 
 def resolve_input(value: str) -> Path:
-    """Resolve an input without loading the CPU-only ML pipeline."""
+    """Resolve an input without loading the ML pipeline."""
     candidate = Path(value)
     if candidate.is_file():
         return candidate.resolve()
@@ -180,7 +181,7 @@ def next_action(job_dir: Path) -> dict[str, object]:
     if active_lock and lock_process_is_active(active_lock):
         # A run may outlive the terminal tool's foreground timeout.  Returning
         # a command here would make an agent start a duplicate process or burn
-        # its context on polling an already-running CPU job.
+        # its context on polling an already-running job.
         return {
             "status": "running",
             "stage": "run",
@@ -1515,13 +1516,13 @@ def main() -> None:
     run.add_argument("--output", type=Path)
     run.add_argument("--quiet", action="store_true")
 
-    run_large = subparsers.add_parser("run-large", help="Chunked CPU mode for CSV/TSV semantic cores; full data is partitioned CSV, not Excel.")
+    run_large = subparsers.add_parser("run-large", help="Chunked local GPU/CPU mode for CSV/TSV semantic cores; full data is partitioned CSV, not Excel.")
     run_large.add_argument("input")
     run_large.add_argument("--job", required=True)
     run_large.add_argument("--chunk-size", type=int, default=50000)
     run_large.add_argument("--quiet", action="store_true")
 
-    run_auto_parser = subparsers.add_parser("run-auto", help="Choose standard or large CPU mode from the prepared unique-phrase count.")
+    run_auto_parser = subparsers.add_parser("run-auto", help="Choose standard or large local GPU/CPU mode from the prepared unique-phrase count.")
     run_auto_parser.add_argument("input")
     run_auto_parser.add_argument("--job", required=True)
     run_auto_parser.add_argument("--large-threshold", type=int, default=DEFAULT_LARGE_THRESHOLD)
