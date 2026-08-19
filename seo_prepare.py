@@ -258,10 +258,8 @@ def prepare_job(
     sample["Model Notes"] = ""
     sample["Knowledge Source"] = "current representative sample"
     sample["Source Job"] = ""
-    sample.insert(0, "Sample ID", [f"row-{index:06d}" for index in range(1, len(sample) + 1)])
     sample = sample[
         [
-            "Sample ID",
             "Phrase",
             "Occurrences",
             "Search Volume",
@@ -287,6 +285,11 @@ def prepare_job(
             .drop(columns=["_phrase_key", "_prior"])
             .head(sample_size)
         )
+
+    # Reused knowledge predates this job and has no job-local identifier.
+    # Create IDs only after combining both sources, otherwise selecting the
+    # prior table with the current sample columns raises "Sample ID not in index".
+    sample.insert(0, "Sample ID", [f"row-{index:06d}" for index in range(1, len(sample) + 1)])
 
     job_name_slug = slugify(job_name or f"{input_path.stem}-{topic}")
     workflow_job_id = f"seo-{uuid.uuid4().hex[:16]}"
