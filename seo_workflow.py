@@ -64,12 +64,13 @@ ALLOWED_ROOT_PYTHON_FILES = {
     "seo_workflow.py",
 }
 VALID_LABELS = {"commercial", "informational", "garbage"}
-MIN_REVIEWED_LABELS = 100
+MIN_REVIEWED_LABELS = 150
 MIN_EXAMPLES_PER_CLASS = 10
 MIN_SEEDS_PER_CLASS = 5
 HIGH_PRIORITY_REVIEW_ROWS = 50
 GARBAGE_SHARE_WARNING = 0.35
-HIGH_GARBAGE_ADDITIONAL_LABELS = 400
+STANDARD_LABEL_TARGET = 300
+HIGH_GARBAGE_LABEL_TARGET = 500
 INITIAL_LABEL_BATCH_SIZE = 50
 ACTIVE_REVIEW_BATCH_SIZE = 50
 DEFAULT_LARGE_THRESHOLD = 100_000
@@ -240,13 +241,15 @@ def next_action(job_dir: Path) -> dict[str, object]:
             "reason": "Job has no valid inspection.json.",
             "instruction": "Report the block; do not create a replacement script.",
         }
-    if reviewed < min(100, total):
+    initial_target = min(MIN_REVIEWED_LABELS, total)
+    if reviewed < initial_target:
         return {
             "status": "continue",
             "stage": "initial_labeling",
             "action": "label_initial_batch",
             "labels_reviewed": reviewed,
-            "command": f'{HERMES_COMMAND} sample --job "{job_dir.name}" --offset 0 --limit {min(INITIAL_LABEL_BATCH_SIZE, total - reviewed)} --quiet',
+            "target_labels": initial_target,
+            "command": f'{HERMES_COMMAND} sample --job "{job_dir.name}" --offset 0 --limit {min(INITIAL_LABEL_BATCH_SIZE, initial_target - reviewed)} --quiet',
             "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
         }
     non_label_errors = [error for error in errors if not error.startswith("Only ") and "Class " not in error and "priority rows" not in error]
@@ -259,9 +262,20 @@ def next_action(job_dir: Path) -> dict[str, object]:
             "blocking_errors": non_label_errors[:5],
             "instruction": "Update only the requested topic-specific fields in job_config.json, then call next again.",
         }
-    normal_target = min(200, total)
+    priority_unreviewed = int(quality.get("high_priority_unreviewed", 0)) if isinstance(quality, dict) else 0
+    if priority_unreviewed:
+        return {
+            "status": "continue",
+            "stage": "priority_review",
+            "action": "label_priority_batch",
+            "labels_reviewed": reviewed,
+            "remaining_priority_rows": priority_unreviewed,
+            "command": f'{HERMES_COMMAND} priority-review --job "{job_dir.name}" --limit {min(ACTIVE_REVIEW_BATCH_SIZE, priority_unreviewed)} --quiet',
+            "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
+        }
+    normal_target = min(STANDARD_LABEL_TARGET, total)
     adaptive_target = (
-        min(HIGH_GARBAGE_ADDITIONAL_LABELS, total)
+        min(HIGH_GARBAGE_LABEL_TARGET, total)
         if garbage_share > GARBAGE_SHARE_WARNING
         else normal_target
     )
@@ -425,6 +439,47 @@ def label_quality_status(
             "do not invent labels merely to meet a quota."
         )
 
+    # These are quality warnings, not artificial class quotas.  The workflow
+    # must allow a genuinely one-sided core, while making a weak training set
+    # visible before its labels are propagated to every phrase.
+    intent_coverage_target = min(
+        30,
+        max(MIN_EXAMPLES_PER_CLASS, (labeled_count + 9) // 10),
+    )
+    weak_intent_classes = [
+        label
+        for label in ("commercial", "informational")
+        if counts[label] < intent_coverage_target
+    ]
+    if weak_intent_classes:
+        warnings.append(
+            "Weak intent coverage for "
+            + ", ".join(weak_intent_classes)
+            + f": fewer than {intent_coverage_target} labels. Review more boundary examples."
+        )
+
+    phrase_keys = phrases.str.lower().str.replace("ё", "е", regex=False).str.replace(r"\s+", " ", regex=True)
+    duplicate_labels = pd.DataFrame({"phrase": phrase_keys, "label": normalized_labels})
+    duplicate_labels = duplicate_labels[duplicate_labels["phrase"].ne("") & duplicate_labels["label"].notna()]
+    conflicting_duplicate_labels = int(
+        (duplicate_labels.groupby("phrase")["label"].nunique() > 1).sum()
+    )
+    if conflicting_duplicate_labels:
+        warnings.append(
+            f"{conflicting_duplicate_labels} duplicate phrases have conflicting labels. "
+            "Check them before saving knowledge."
+        )
+
+    reviewed_confidence = confidence[confidence_complete]
+    low_confidence_share = (
+        float(reviewed_confidence.lt(0.70).mean()) if not reviewed_confidence.empty else 0.0
+    )
+    if len(reviewed_confidence) >= 30 and low_confidence_share > 0.30:
+        warnings.append(
+            f"{low_confidence_share:.1%} of reviewed labels have confidence below 0.70. "
+            "The topic boundary may need more representative examples."
+        )
+
     priority_columns = [
         column
         for column in (lookup.get("search volume"), lookup.get("occurrences"))
@@ -501,6 +556,10 @@ def label_quality_status(
         "missing_or_invalid_confidence": missing_or_invalid_confidence,
         "high_priority_unreviewed": high_priority_unreviewed,
         "garbage_share": round(garbage_share, 6),
+        "intent_coverage_target": intent_coverage_target,
+        "weak_intent_classes": weak_intent_classes,
+        "conflicting_duplicate_labels": conflicting_duplicate_labels,
+        "low_confidence_share": round(low_confidence_share, 6),
         "positive_marker_garbage_conflicts": len(conflicting_garbage),
         "low_confidence_without_notes": low_confidence_without_notes,
     }
@@ -706,6 +765,49 @@ def sample_rows(job_dir: Path, offset: int, limit: int, only_unlabeled: bool = T
         "limit": limit,
         "total_unlabeled": int(len(candidates)),
         "rows": rows,
+    }
+
+
+def select_priority_review(job_dir: Path, limit: int) -> dict[str, object]:
+    """Return unlabeled rows from the protected high-priority set.
+
+    This must use exactly the same combined priority metric as
+    ``label_quality_status``.  Otherwise a job can reach its active-learning
+    target and then be blocked by an unreviewed high-volume phrase that was
+    never offered to the model.
+    """
+    if limit < 1 or limit > 50:
+        raise ValueError("limit must be from 1 to 50.")
+    frame = load_label_sheet(job_dir)
+    labels, phrases = label_summary(frame)
+    confidence = pd.to_numeric(frame["Model Confidence"], errors="coerce")
+    reviewed = labels.notna() & phrases.ne("") & confidence.between(0.0, 1.0, inclusive="both")
+    lookup = normalized_column_lookup(frame)
+    priority = pd.Series(0.0, index=frame.index)
+    for column in (lookup.get("search volume"), lookup.get("occurrences")):
+        if column is not None:
+            priority += pd.to_numeric(frame[column], errors="coerce").fillna(0)
+    protected_index = priority.nlargest(min(HIGH_PRIORITY_REVIEW_ROWS, len(frame))).index
+    candidates = frame.loc[protected_index].copy()
+    candidates["_priority"] = priority.loc[protected_index]
+    candidates = candidates[~reviewed.loc[protected_index]].sort_values(
+        ["_priority", "Sample ID"], ascending=[False, True]
+    )
+    view = candidates.head(limit)
+    rows = [
+        {
+            "id": str(row["Sample ID"]),
+            "phrase": str(row["Phrase"]),
+            "reason": "required_priority_coverage",
+            "priority": round(float(row["_priority"]), 3),
+        }
+        for _, row in view.iterrows()
+    ]
+    return {
+        "stage": read_state(job_dir).get("stage", "initial_labeling"),
+        "selection": "required_priority_coverage",
+        "rows": rows,
+        "remaining_priority_rows": int(len(candidates) - len(view)),
     }
 
 
@@ -1510,6 +1612,14 @@ def main() -> None:
     review.add_argument("--limit", type=int, default=20)
     review.add_argument("--quiet", action="store_true")
 
+    priority_review = subparsers.add_parser(
+        "priority-review",
+        help="Select unlabeled phrases from the required high-priority coverage set.",
+    )
+    priority_review.add_argument("--job", required=True)
+    priority_review.add_argument("--limit", type=int, default=20)
+    priority_review.add_argument("--quiet", action="store_true")
+
     run = subparsers.add_parser("run", help="Run classification and clustering for a prepared job.")
     run.add_argument("input")
     run.add_argument("--job", required=True)
@@ -1663,6 +1773,8 @@ def main() -> None:
         )
     elif args.command == "review":
         print_result(select_active_review(resolve_job(args.job), args.limit), args.quiet)
+    elif args.command == "priority-review":
+        print_result(select_priority_review(resolve_job(args.job), args.limit), args.quiet)
     elif args.command == "run":
         job_dir = resolve_job(args.job)
         readiness = job_status(job_dir)

@@ -453,6 +453,103 @@ def flatten_config(value: Any, prefix: str = "") -> list[tuple[str, str]]:
     return rows
 
 
+def build_human_review_queue(
+    combined: pd.DataFrame,
+    garbage: pd.DataFrame,
+    classification_threshold: float,
+    cluster_threshold: float,
+) -> pd.DataFrame:
+    """Build a bounded review queue with coverage, not only uncertainty.
+
+    A classifier can be confidently wrong.  The queue therefore reserves space
+    for high-value phrases, cluster representatives and class-boundary rows in
+    addition to low-confidence predictions.
+    """
+    pieces: list[pd.DataFrame] = []
+
+    def with_reason(frame: pd.DataFrame, reason: str, order: int, limit: int) -> None:
+        if frame.empty:
+            return
+        selected = frame.head(limit).copy()
+        selected["Review reason"] = reason
+        selected["_review_order"] = order
+        pieces.append(selected)
+
+    def ranked(frame: pd.DataFrame, columns: list[str], ascending: list[bool]) -> pd.DataFrame:
+        result = frame.copy()
+        result["_review_volume"] = pd.to_numeric(
+            result.get("Search Volume", 0), errors="coerce"
+        ).fillna(0)
+        return result.sort_values(columns, ascending=ascending, kind="stable")
+
+    confidence = pd.to_numeric(combined.get("Classification confidence", 0), errors="coerce").fillna(0)
+    cluster_probability = pd.to_numeric(combined.get("Cluster probability", 0), errors="coerce").fillna(0)
+    uncertain = combined[
+        confidence.lt(classification_threshold)
+        | combined.get("Cluster", pd.Series("Unclustered", index=combined.index)).eq("Unclustered")
+        | cluster_probability.lt(cluster_threshold)
+    ].copy()
+    uncertain["_confidence"] = confidence.loc[uncertain.index]
+    uncertain["_cluster_probability"] = cluster_probability.loc[uncertain.index]
+    uncertain["_review_volume"] = pd.to_numeric(uncertain.get("Search Volume", 0), errors="coerce").fillna(0)
+    uncertain = uncertain.sort_values(
+        ["_confidence", "_cluster_probability", "_review_volume"],
+        ascending=[True, True, False],
+        kind="stable",
+    )
+    with_reason(uncertain, "Low confidence, unclustered, or weak cluster", 1, 175)
+
+    high_risk_garbage = ranked(garbage, ["Topic relevance", "_review_volume"], [False, False])
+    with_reason(high_risk_garbage, "Garbage near the topic-relevance boundary", 2, 100)
+
+    if {"P(commercial)", "P(informational)"}.issubset(combined.columns):
+        boundary = combined.copy()
+        boundary["_intent_margin"] = (
+            pd.to_numeric(boundary["P(commercial)"], errors="coerce").fillna(0)
+            - pd.to_numeric(boundary["P(informational)"], errors="coerce").fillna(0)
+        ).abs()
+        boundary = ranked(boundary, ["_intent_margin", "_review_volume"], [True, False])
+        with_reason(boundary, "Commercial/informational probability boundary", 3, 75)
+
+    high_value = ranked(combined, ["_review_volume"], [False])
+    with_reason(high_value, "High-priority phrase", 4, 75)
+
+    if not combined.empty and {"Intent", "Cluster"}.issubset(combined.columns):
+        cluster_sizes = (
+            combined[combined["Cluster"].ne("Unclustered")]
+            .groupby(["Intent", "Cluster"], dropna=False)
+            .size()
+            .sort_values(ascending=False)
+        )
+        representatives: list[pd.DataFrame] = []
+        for (intent, cluster), _ in cluster_sizes.items():
+            candidates = combined[combined["Intent"].eq(intent) & combined["Cluster"].eq(cluster)].copy()
+            candidates["_review_volume"] = pd.to_numeric(candidates.get("Search Volume", 0), errors="coerce").fillna(0)
+            representatives.append(candidates.nlargest(2, "_review_volume"))
+            if sum(len(part) for part in representatives) >= 75:
+                break
+        if representatives:
+            with_reason(pd.concat(representatives, ignore_index=True), "Representative high-priority phrase in cluster", 5, 75)
+
+    if not pieces:
+        return pd.DataFrame()
+    review = pd.concat(pieces, ignore_index=True, sort=False)
+    key = review.get("Normalized", review.get("Phrase", pd.Series("", index=review.index))).astype(str)
+    reason_map = (
+        pd.DataFrame({"key": key, "reason": review["Review reason"]})
+        .groupby("key", sort=False)["reason"]
+        .agg(lambda values: " | ".join(dict.fromkeys(values)))
+    )
+    review["_review_key"] = key
+    review = review.sort_values(["_review_order", "_review_volume"], ascending=[True, False], kind="stable")
+    review = review.drop_duplicates("_review_key", keep="first").head(500).copy()
+    review["Review reason"] = review["_review_key"].map(reason_map)
+    review = review.drop(columns=[column for column in review.columns if column.startswith("_review_") or column in {"_confidence", "_cluster_probability", "_intent_margin"}])
+    for column in ("Correct Intent", "Correct Cluster", "Reviewer Notes"):
+        review[column] = ""
+    return review
+
+
 def run_pipeline(
     input_value: str,
     config_path: Path,
@@ -500,26 +597,9 @@ def run_pipeline(
     combined = pd.concat(intent_frames.values(), ignore_index=True)
     review_threshold = float(config["clustering"].get("review_threshold", 0.35))
     classification_threshold = float(config.get("classification_review_threshold", 0.65))
-    review = combined[
-        combined["Classification confidence"].lt(classification_threshold)
-        | combined["Cluster"].eq("Unclustered")
-        | combined["Cluster probability"].lt(review_threshold)
-    ].copy()
-    review["Review reason"] = np.where(
-        review["Classification confidence"].lt(classification_threshold),
-        "Low classification confidence",
-        np.where(
-            review["Cluster"].eq("Unclustered"),
-            "Unclustered phrase",
-            "Low cluster probability",
-        ),
+    review = build_human_review_queue(
+        combined, garbage, classification_threshold, review_threshold
     )
-    high_risk_garbage = garbage.nlargest(min(100, len(garbage)), "Topic relevance").copy()
-    high_risk_garbage["Review reason"] = "Garbage with comparatively high topic relevance"
-    review = pd.concat([review.head(200), high_risk_garbage], ignore_index=True)
-    review["Correct Intent"] = ""
-    review["Correct Cluster"] = ""
-    review["Reviewer Notes"] = ""
 
     cluster_summary = (
         pd.concat(summaries, ignore_index=True)
@@ -806,7 +886,13 @@ def run_large_pipeline(
         sample["Cluster probability"] = np.max(vectors @ fitted.cluster_centers_.T, axis=1)
         cluster_rows.append(sample)
 
-    uncertain: list[pd.DataFrame] = []
+    review_candidates: dict[str, list[pd.DataFrame]] = {
+        "uncertain": [],
+        "garbage_boundary": [],
+        "intent_boundary": [],
+        "high_value": [],
+        "cluster_representative": [],
+    }
     summaries: list[dict[str, Any]] = []
     for part in sorted(parts_dir.glob("part-*.csv.gz")):
         frame = pd.read_csv(part, compression="gzip")
@@ -830,9 +916,43 @@ def run_large_pipeline(
             frame["Cluster probability"] = 0.0
         else:
             frame["Cluster probability"] = pd.to_numeric(frame["Cluster probability"], errors="coerce").fillna(0.0)
-        low = frame[frame["Classification confidence"].lt(float(config.get("classification_review_threshold", 0.65)))].copy()
+        classification_threshold = float(config.get("classification_review_threshold", 0.65))
+        cluster_threshold = float(config.get("clustering", {}).get("review_threshold", 0.35))
+        low = frame[
+            frame["Classification confidence"].lt(classification_threshold)
+            | frame["Cluster"].eq("Unclustered")
+            | frame["Cluster probability"].lt(cluster_threshold)
+        ].copy()
         if not low.empty:
-            uncertain.append(low.nsmallest(200, "Classification confidence"))
+            low["Review reason"] = "Low confidence, unclustered, or weak cluster"
+            review_candidates["uncertain"].append(
+                low.sort_values(["Classification confidence", "Search Volume"], ascending=[True, False]).head(200)
+            )
+        garbage_boundary = frame[frame["Intent"].eq("garbage")].nlargest(100, "Topic relevance").copy()
+        if not garbage_boundary.empty:
+            garbage_boundary["Review reason"] = "Garbage near the topic-relevance boundary"
+            review_candidates["garbage_boundary"].append(garbage_boundary)
+        if {"P(commercial)", "P(informational)"}.issubset(frame.columns):
+            intent_boundary = frame.copy()
+            intent_boundary["_intent_margin"] = (intent_boundary["P(commercial)"] - intent_boundary["P(informational)"]).abs()
+            intent_boundary = intent_boundary.nsmallest(75, "_intent_margin")
+            intent_boundary["Review reason"] = "Commercial/informational probability boundary"
+            review_candidates["intent_boundary"].append(intent_boundary)
+        high_value = frame.nlargest(75, "Search Volume").copy()
+        if not high_value.empty:
+            high_value["Review reason"] = "High-priority phrase"
+            review_candidates["high_value"].append(high_value)
+        clustered = frame[frame["Cluster"].ne("Unclustered")]
+        if not clustered.empty:
+            cluster_rows = (
+                clustered.sort_values("Search Volume", ascending=False)
+                .groupby(["Intent", "Cluster"], dropna=False, group_keys=False)
+                .head(1)
+                .head(75)
+                .copy()
+            )
+            cluster_rows["Review reason"] = "Representative high-priority phrase in cluster"
+            review_candidates["cluster_representative"].append(cluster_rows)
         frame.to_csv(part, index=False, compression="gzip", encoding="utf-8")
         grouped = frame.groupby(["Intent", "Cluster"], dropna=False).agg(Phrases=("Phrase", "size"), Total_Search_Volume=("Search Volume", "sum"), Average_Confidence=("Classification confidence", "mean")).reset_index()
         summaries.extend(grouped.to_dict("records"))
@@ -840,7 +960,40 @@ def run_large_pipeline(
     summary = pd.DataFrame(summaries)
     if not summary.empty:
         summary = summary.groupby(["Intent", "Cluster"], dropna=False).agg(Phrases=("Phrases", "sum"), Total_Search_Volume=("Total_Search_Volume", "sum"), Average_Confidence=("Average_Confidence", "mean")).reset_index().sort_values("Total_Search_Volume", ascending=False)
-    uncertain_frame = pd.concat(uncertain, ignore_index=True).nsmallest(1000, "Classification confidence") if uncertain else pd.DataFrame()
+    review_parts: list[pd.DataFrame] = []
+    queue_limits = {
+        "uncertain": 175,
+        "garbage_boundary": 100,
+        "intent_boundary": 75,
+        "high_value": 75,
+        "cluster_representative": 75,
+    }
+    for kind, limit in queue_limits.items():
+        batches = review_candidates[kind]
+        if not batches:
+            continue
+        candidates = pd.concat(batches, ignore_index=True)
+        if kind == "uncertain":
+            candidates = candidates.sort_values(["Classification confidence", "Search Volume"], ascending=[True, False])
+        elif kind == "intent_boundary":
+            candidates = candidates.sort_values(["_intent_margin", "Search Volume"], ascending=[True, False])
+        elif kind == "garbage_boundary":
+            candidates = candidates.sort_values(["Topic relevance", "Search Volume"], ascending=[False, False])
+        else:
+            candidates = candidates.sort_values("Search Volume", ascending=False)
+        review_parts.append(candidates.head(limit))
+    uncertain_frame = pd.concat(review_parts, ignore_index=True, sort=False) if review_parts else pd.DataFrame()
+    if not uncertain_frame.empty:
+        review_key = uncertain_frame.get("Normalized", uncertain_frame["Phrase"]).astype(str)
+        reason_map = (
+            pd.DataFrame({"key": review_key, "reason": uncertain_frame["Review reason"]})
+            .groupby("key", sort=False)["reason"]
+            .agg(lambda values: " | ".join(dict.fromkeys(values)))
+        )
+        uncertain_frame["_review_key"] = review_key
+        uncertain_frame = uncertain_frame.drop_duplicates("_review_key", keep="first").head(500).copy()
+        uncertain_frame["Review reason"] = uncertain_frame["_review_key"].map(reason_map)
+        uncertain_frame = uncertain_frame.drop(columns=[column for column in ("_review_key", "_intent_margin") if column in uncertain_frame])
     uncertain_path = output_dir / "uncertain_review.csv"
     # These two exports are intended for people as well as scripts.  The BOM
     # lets desktop Excel on Windows recognise Russian UTF-8 text correctly.
