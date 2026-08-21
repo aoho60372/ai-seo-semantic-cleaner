@@ -19,7 +19,7 @@ Example: /sknow semantic_clustered_reviewed.xlsx
 Otherwise run exactly:
 
 ```text
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ".\seo.ps1" apply-review "<reviewed-file.xlsx>" --quiet
+"./.venv/Scripts/python.exe" "./seo_workflow.py" apply-review "<reviewed-file.xlsx>" --quiet
 ```
 
 The workflow validates that the workbook exists and reads its permanent

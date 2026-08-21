@@ -50,6 +50,7 @@ def build_seo_autopilot_nudge(*, attempts: int = 0) -> str | None:
         return None
     return (
         "[SEO autopilot: the workflow is still unfinished. Do not send a progress message "
-        "or wait for the user. Immediately run `next --job \"%s\" --quiet`, follow its "
+        "or wait for the user. Immediately run `\"./.venv/Scripts/python.exe\" "
+        "\"./seo_workflow.py\" next --job \"%s\" --quiet`, follow its "
         "returned command, and continue the loop. Stop only if `next` returns stop or blocked.]"
     ) % job

@@ -1,7 +1,7 @@
 {
   "job_name": "REPLACE_WITH_UNIQUE_JOB_NAME",
   "phrase_column": null,
-  "embedding_model": "local:multilingual-e5-small",
+  "embedding_model": "local:multilingual-e5-base",
   "embedding_device": "auto",
   "embedding_batch_size": 256,
   "embedding_prefix": "query: ",
@@ -35,9 +35,44 @@
     ],
     "commercial_markers": [],
     "informational_markers": [],
+    "weak_question_markers": [],
+    "family_rules": {
+      "commercial": [],
+      "informational": [],
+      "neutral": []
+    },
     "semantic_margin": 0.03,
     "review_margin": 0.04,
+    "informational_decision_margin": 0.12,
+    "strong_informational_decision_margin": 0.02,
+    "weak_question_informational_margin": 0.02,
+    "family_override_tolerance": 0.05,
     "default": "commercial"
+  },
+  "intent_policy": {
+    "commercial_prototypes": [],
+    "implicit_commercial_prototypes": [],
+    "informational_prototypes": [],
+    "synthetic_weight": 0.75,
+    "informational_evidence_margin": 0.005,
+    "strength": 0.12,
+    "minimum_similarity": 0.55
+  },
+  "relevance": {
+    "relevant_prototypes": [],
+    "garbage_prototypes": [],
+    "synthetic_weight": 1.0,
+    "garbage_threshold": 0.45,
+    "quarantine_margin": 0.10,
+    "outlier_garbage_threshold": 0.80,
+    "minimum_garbage_precision": 0.80,
+    "maximum_relevant_false_positive_rate": 0.05,
+    "tfidf_weight": 0.35,
+    "intent_tfidf_weight": 1.25,
+    "max_garbage_class_weight": 8.0,
+    "audit_batch_size": 50,
+    "min_garbage_examples": 30,
+    "max_audit_batches": 6
   },
   "clustering": {
     "batch_size": 256,

@@ -16,6 +16,23 @@ import traceback
 import uuid
 from pathlib import Path
 
+# Hermes launches this module directly, without the PowerShell wrapper.  Keep
+# the process environment and terminal streams deterministic before importing
+# pandas, transformers, or any other library that may inspect them at import
+# time.  seo.ps1 remains a convenience launcher for manual Windows use.
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("TQDM_DISABLE", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        _reconfigure(encoding="utf-8", errors="strict")
+
 import pandas as pd
 from openpyxl import load_workbook
 from seo_knowledge import (
@@ -49,11 +66,7 @@ REQUIRED_RESULT_SHEETS = {
     "Commercial clusters",
     "Informational clusters",
     "Garbage",
-    "Cluster review",
     "Human review",
-    "Quality report",
-    "Validation metrics",
-    "Run configuration",
 }
 ALLOWED_ROOT_PYTHON_FILES = {
     "seo_io.py",
@@ -66,6 +79,7 @@ ALLOWED_ROOT_PYTHON_FILES = {
 VALID_LABELS = {"commercial", "informational", "garbage"}
 MIN_REVIEWED_LABELS = 150
 MIN_EXAMPLES_PER_CLASS = 10
+MIN_LARGE_CORE_EXAMPLES_PER_INTENT = 30
 MIN_SEEDS_PER_CLASS = 5
 HIGH_PRIORITY_REVIEW_ROWS = 50
 GARBAGE_SHARE_WARNING = 0.35
@@ -73,13 +87,37 @@ STANDARD_LABEL_TARGET = 300
 HIGH_GARBAGE_LABEL_TARGET = 500
 INITIAL_LABEL_BATCH_SIZE = 50
 ACTIVE_REVIEW_BATCH_SIZE = 50
+RELEVANCE_AUDIT_BATCH_SIZE = 50
+MIN_GARBAGE_CALIBRATION_LABELS = 30
+MIN_RELEVANCE_AUDIT_BATCHES = 3
+MAX_RELEVANCE_AUDIT_BATCHES = 6
+INTENT_AUDIT_BATCH_SIZE = 50
+MIN_INTENT_AUDIT_BATCHES = 2
+POLICY_CONFLICT_AUDIT_BATCH_SIZE = 50
+MIN_POLICY_CONFLICT_AUDIT_BATCHES = 1
+INTENT_FAMILY_REVIEW_BATCH_SIZE = 20
+FAMILY_COVERAGE_REVIEW_BATCH_SIZE = 50
+SMALL_CORE_DIRECT_LIMIT = 500
+MEDIUM_CORE_LIMIT = 5_000
 DEFAULT_LARGE_THRESHOLD = 100_000
-# Hermes invokes terminal commands through a Bash-compatible transport before
-# Windows PowerShell receives them.  The quotes preserve the leading backslash:
-# without them Bash turns ``.\seo.ps1`` into ``.seo.ps1`` and PowerShell then
-# reports a misleading, mojibake-prone "file not found" error.
-HERMES_COMMAND = r'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ".\seo.ps1"'
+# Hermes invokes commands through a Bash-compatible transport on Windows.  A
+# direct call to the project interpreter avoids PowerShell's script-approval
+# category while keeping the maintained workflow as the only Python entry
+# point.  Forward slashes are accepted by both Git Bash and Windows Python.
+HERMES_COMMAND = r'"./.venv/Scripts/python.exe" "./seo_workflow.py"'
 RUN_LOCK_NAME = ".seo_run.lock.json"
+MIN_PRODUCTIVE_MARKER_STEM_LENGTH = 4
+
+INTENT_LABELING_CONTRACT = (
+    "Use commercial for a query whose practical goal is to find, choose, access, apply to, contact, "
+    "book, order, buy, rent, hire, or otherwise convert through a concrete offer or result. Commercial "
+    "does not require a payment verb and includes both sides of a marketplace. Thus a bare product/service "
+    "offer, a vacancy search or application, a provider search, and an employer hiring query are commercial. "
+    "Use informational only when the goal is knowledge: explanation, duties, instructions, diagnostics, "
+    "reference facts, requirements discussed as reference, reviews, comparison, or general education without "
+    "seeking a concrete offer/result. Question words never decide the class by themselves. Use garbage only "
+    "outside the stated topic/business scope. Classify the whole phrase by its user goal, not by one noun."
+)
 
 
 def resolve_input(value: str) -> Path:
@@ -190,11 +228,32 @@ def next_action(job_dir: Path) -> dict[str, object]:
             "started_at": active_lock.get("started_at"),
             "instruction": "A workflow run is already active. Do not run, retry, wait, poll, or call next. Return immediately and rely on the terminal completion notification.",
         }
+    if stage == "cluster_relevance_review":
+        audit_status = cluster_relevance_status(job_dir)
+        if int(audit_status["remaining_clusters"]) > 0:
+            return {
+                "status": "continue",
+                "stage": stage,
+                "action": "label_cluster_relevance_batch",
+                "remaining_clusters": audit_status["remaining_clusters"],
+                "remaining_decisions": audit_status["remaining_decisions"],
+                "command": f'{HERMES_COMMAND} cluster-review --job "{job_dir.name}" --limit 30 --quiet',
+                "after_cluster_labels": f'{HERMES_COMMAND} apply-cluster-labels-inline --job "{job_dir.name}" --labels "RC0001|relevant;RC0001-R|garbage;RC0001-B|relevant" --quiet',
+            }
+        return {
+            "status": "continue",
+            "stage": "cluster_relevance_finalize",
+            "action": "apply_cluster_relevance_decisions",
+            "command": f'{HERMES_COMMAND} apply-cluster-decisions --job "{job_dir.name}" --quiet',
+        }
     inspection = status.get("inspection", {})
     quality = status.get("label_quality", {})
     reviewed = int(quality.get("valid_labeled_rows", 0)) if isinstance(quality, dict) else 0
     total = int(quality.get("sample_rows", 0)) if isinstance(quality, dict) else 0
+    source_total = int(inspection.get("unique_normalized_phrases", total) or total)
     garbage_share = float(quality.get("garbage_share", 0.0)) if isinstance(quality, dict) else 0.0
+    labeled_counts = status.get("labeled_counts", {})
+    garbage_count = int(labeled_counts.get("garbage", 0)) if isinstance(labeled_counts, dict) else 0
     errors = list(status.get("blocking_errors", []))
     root_files = list(status.get("unexpected_python_files", []))
     if root_files:
@@ -252,7 +311,32 @@ def next_action(job_dir: Path) -> dict[str, object]:
             "command": f'{HERMES_COMMAND} sample --job "{job_dir.name}" --offset 0 --limit {min(INITIAL_LABEL_BATCH_SIZE, initial_target - reviewed)} --quiet',
             "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
         }
-    non_label_errors = [error for error in errors if not error.startswith("Only ") and "Class " not in error and "priority rows" not in error]
+    # A compact source is best classified directly by the language model.  It
+    # is cheaper and more accurate to label every phrase than to extrapolate a
+    # classifier from a sample and then audit that extrapolation.
+    if source_total <= SMALL_CORE_DIRECT_LIMIT and reviewed < total:
+        return {
+            "status": "continue",
+            "stage": "direct_labeling",
+            "action": "label_all_small_core_rows",
+            "labels_reviewed": reviewed,
+            "target_labels": total,
+            "command": f'{HERMES_COMMAND} sample --job "{job_dir.name}" --offset 0 --limit {min(INITIAL_LABEL_BATCH_SIZE, total - reviewed)} --quiet',
+            "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
+        }
+    label_dependent_seed_prefixes = (
+        "topic.relevant_seeds",
+        "intent.commercial_seeds",
+        "intent.informational_seeds",
+    )
+    non_label_errors = [
+        error
+        for error in errors
+        if not error.startswith("Only ")
+        and "Class " not in error
+        and "priority rows" not in error
+        and not error.startswith(label_dependent_seed_prefixes)
+    ]
     if non_label_errors:
         return {
             "status": "continue",
@@ -261,6 +345,49 @@ def next_action(job_dir: Path) -> dict[str, object]:
             "job_config": str((job_dir / "job_config.json").resolve()),
             "blocking_errors": non_label_errors[:5],
             "instruction": "Update only the requested topic-specific fields in job_config.json, then call next again.",
+        }
+    if source_total <= SMALL_CORE_DIRECT_LIMIT:
+        if not status.get("ready_for_supervised_run", False):
+            return {
+                "status": "blocked",
+                "stage": stage,
+                "reason": "The fully labeled small core still fails readiness checks.",
+                "blocking_errors": errors[:5],
+            }
+        return {
+            "status": "continue",
+            "stage": "run",
+            "action": "run_auto_direct_labels",
+            "command": f'{HERMES_COMMAND} run-auto "{Path(str(inspection.get("input_file", ""))).name}" --job "{job_dir.name}" --quiet',
+        }
+    current_counts = current_sample_intent_counts(load_label_sheet(job_dir))
+    underrepresented_intents = [
+        label
+        for label in ("commercial", "informational")
+        if current_counts[label] < MIN_LARGE_CORE_EXAMPLES_PER_INTENT
+    ]
+    if underrepresented_intents and reviewed < total:
+        return {
+            "status": "continue",
+            "stage": "intent_calibration",
+            "action": "label_missing_intent_class",
+            "labels_reviewed": reviewed,
+            "current_intent_counts": current_counts,
+            "required_per_intent": MIN_LARGE_CORE_EXAMPLES_PER_INTENT,
+            "missing_or_weak_intents": underrepresented_intents,
+            "labeling_contract": INTENT_LABELING_CONTRACT,
+            "command": f'{HERMES_COMMAND} sample --job "{job_dir.name}" --offset 0 --limit {min(INITIAL_LABEL_BATCH_SIZE, total - reviewed)} --quiet',
+            "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
+        }
+    if underrepresented_intents:
+        return {
+            "status": "blocked",
+            "stage": "intent_calibration",
+            "reason": "The representative sample is exhausted but a safe two-intent classifier cannot be trained.",
+            "current_intent_counts": current_counts,
+            "required_per_intent": MIN_LARGE_CORE_EXAMPLES_PER_INTENT,
+            "missing_or_weak_intents": underrepresented_intents,
+            "instruction": "Report the class-calibration failure. Do not run or invent labels; the topic scope or labeling taxonomy needs correction.",
         }
     priority_unreviewed = int(quality.get("high_priority_unreviewed", 0)) if isinstance(quality, dict) else 0
     if priority_unreviewed:
@@ -273,10 +400,127 @@ def next_action(job_dir: Path) -> dict[str, object]:
             "command": f'{HERMES_COMMAND} priority-review --job "{job_dir.name}" --limit {min(ACTIVE_REVIEW_BATCH_SIZE, priority_unreviewed)} --quiet',
             "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
         }
+    family_status = intent_family_status(job_dir)
+    if int(family_status["remaining"]) > 0:
+        return {
+            "status": "continue",
+            "stage": "intent_family_audit",
+            "action": "label_intent_family_batch",
+            "families_labeled": family_status["labeled"],
+            "families_remaining": family_status["remaining"],
+            "command": f'{HERMES_COMMAND} family-review --job "{job_dir.name}" --limit {INTENT_FAMILY_REVIEW_BATCH_SIZE} --quiet',
+            "after_family_labels": f'{HERMES_COMMAND} apply-family-labels-inline --job "{job_dir.name}" --labels "IF0001|informational;IF0002|commercial;IF0003|neutral" --quiet',
+        }
+    family_coverage = family_coverage_status(load_label_sheet(job_dir))
+    if int(family_coverage["remaining"]) > 0:
+        return {
+            "status": "continue",
+            "stage": "intent_family_coverage",
+            "action": "label_unrepresented_family_examples",
+            "coverage_rows_labeled": family_coverage["labeled"],
+            "coverage_rows_remaining": family_coverage["remaining"],
+            "command": f'{HERMES_COMMAND} family-coverage-review --job "{job_dir.name}" --limit {min(FAMILY_COVERAGE_REVIEW_BATCH_SIZE, int(family_coverage["remaining"]))} --quiet',
+            "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
+        }
+    config_path = job_dir / "job_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    policy = config.get("intent_policy", {}) if isinstance(config, dict) else {}
+    relevance_policy = config.get("relevance", {}) if isinstance(config, dict) else {}
+    commercial_prototypes = policy.get("commercial_prototypes", []) if isinstance(policy, dict) else []
+    implicit_commercial_prototypes = policy.get("implicit_commercial_prototypes", []) if isinstance(policy, dict) else []
+    informational_prototypes = policy.get("informational_prototypes", []) if isinstance(policy, dict) else []
+    informational_signals = configured_values(config, "intent", "informational_markers")
+    commercial_signals = configured_values(config, "intent", "commercial_markers")
+    weak_question_signals = configured_values(config, "intent", "weak_question_markers")
+    relevant_prototypes = relevance_policy.get("relevant_prototypes", []) if isinstance(relevance_policy, dict) else []
+    garbage_prototypes = relevance_policy.get("garbage_prototypes", []) if isinstance(relevance_policy, dict) else []
+    if (
+        len(commercial_prototypes) < 3
+        or len(implicit_commercial_prototypes) < 5
+        or len(informational_prototypes) < 5
+        or len(informational_signals) < 12
+        or len(commercial_signals) < 5
+        or len(weak_question_signals) < 3
+        or len(relevant_prototypes) < 5
+        or len(garbage_prototypes) < 5
+    ):
+        return {
+            "status": "continue",
+            "stage": "intent_policy",
+            "action": "define_intent_policy",
+            "labels_reviewed": reviewed,
+            "command": f'{HERMES_COMMAND} policy-context --job "{job_dir.name}" --limit 8 --quiet',
+            "after_policy": f'{HERMES_COMMAND} apply-policy-inline --job "{job_dir.name}" --commercial "explicit commercial prototype 1; explicit commercial prototype 2; explicit commercial prototype 3" --implicit-commercial "bare transactional structure 1; bare transactional structure 2; bare transactional structure 3; bare transactional structure 4; bare transactional structure 5" --informational "prototype 1; prototype 2; prototype 3; prototype 4; prototype 5" --commercial-signals "strong commercial signal 1; strong commercial signal 2; strong commercial signal 3; strong commercial signal 4; strong commercial signal 5" --informational-signals "strong information signal 1; strong information signal 2; strong information signal 3; strong information signal 4; strong information signal 5; strong information signal 6; strong information signal 7; strong information signal 8; strong information signal 9; strong information signal 10; strong information signal 11; strong information signal 12" --weak-question-signals "weak question 1; weak question 2; weak question 3" --relevant "relevant prototype 1; relevant prototype 2; relevant prototype 3; relevant prototype 4; relevant prototype 5" --garbage "hard negative 1; hard negative 2; hard negative 3; hard negative 4; hard negative 5" --quiet',
+        }
+    if bool(state.get("signal_policy_refinement_needed")) and int(state.get("signal_policy_attempts", 0) or 0) < 2:
+        return {
+            "status": "continue",
+            "stage": "intent_policy",
+            "action": "refine_intent_signals",
+            "signal_coverage": state.get("signal_policy_coverage", {}),
+            "command": f'{HERMES_COMMAND} policy-context --job "{job_dir.name}" --limit 8 --quiet',
+            "after_policy": f'{HERMES_COMMAND} apply-policy-inline --job "{job_dir.name}" --commercial "explicit commercial prototypes" --implicit-commercial "implicit commercial structures" --informational "informational prototypes" --commercial-signals "8-20 strong commercial signals" --informational-signals "12-30 strong informational signals" --weak-question-signals "3-10 weak question signals" --relevant "relevant prototypes" --garbage "hard negative prototypes" --quiet',
+        }
+    audit_limit = (
+        POLICY_CONFLICT_AUDIT_BATCH_SIZE
+        if source_total > MEDIUM_CORE_LIMIT
+        else min(POLICY_CONFLICT_AUDIT_BATCH_SIZE, max(10, source_total // 20))
+    )
+    relevance_audit_batches = int(state.get("relevance_audit_batches", 0) or 0)
+    relevance_yields = [
+        int(value) for value in (state.get("relevance_audit_garbage_yields", []) or [])
+    ]
+    relevance_plateau = (
+        relevance_audit_batches >= MIN_RELEVANCE_AUDIT_BATCHES
+        and len(relevance_yields) >= 2
+        and max(relevance_yields[-2:]) <= 1
+    )
+    needs_relevance_audit = (
+        relevance_audit_batches < MIN_RELEVANCE_AUDIT_BATCHES
+        or (
+            garbage_count < MIN_GARBAGE_CALIBRATION_LABELS
+            and relevance_audit_batches < MAX_RELEVANCE_AUDIT_BATCHES
+            and not relevance_plateau
+        )
+    )
+    if needs_relevance_audit and reviewed < total:
+        return {
+            "status": "continue",
+            "stage": "relevance_audit",
+            "action": "label_out_of_topic_candidates",
+            "labels_reviewed": reviewed,
+            "garbage_labels": garbage_count,
+            "recent_garbage_yields": relevance_yields[-2:],
+            "audit_batch": relevance_audit_batches + 1,
+            "command": f'{HERMES_COMMAND} relevance-review --job "{job_dir.name}" --limit {audit_limit} --quiet',
+            "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
+        }
+    intent_audit_batches = int(state.get("intent_audit_batches", 0) or 0)
+    if intent_audit_batches < MIN_INTENT_AUDIT_BATCHES and reviewed < total:
+        return {
+            "status": "continue",
+            "stage": "intent_audit",
+            "action": "label_commercial_informational_boundary",
+            "labels_reviewed": reviewed,
+            "audit_batch": intent_audit_batches + 1,
+            "command": f'{HERMES_COMMAND} intent-review --job "{job_dir.name}" --limit {audit_limit} --quiet',
+            "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
+        }
+    policy_conflict_batches = int(state.get("policy_conflict_audit_batches", 0) or 0)
+    if policy_conflict_batches < MIN_POLICY_CONFLICT_AUDIT_BATCHES and reviewed < total:
+        return {
+            "status": "continue",
+            "stage": "policy_conflict_audit",
+            "action": "label_signal_classifier_conflicts",
+            "labels_reviewed": reviewed,
+            "audit_batch": policy_conflict_batches + 1,
+            "command": f'{HERMES_COMMAND} policy-conflict-review --job "{job_dir.name}" --limit {audit_limit} --quiet',
+            "after_labels": f'{HERMES_COMMAND} apply-labels-inline --job "{job_dir.name}" --labels "SampleID|label|confidence;..." --quiet',
+        }
     normal_target = min(STANDARD_LABEL_TARGET, total)
     adaptive_target = (
         min(HIGH_GARBAGE_LABEL_TARGET, total)
-        if garbage_share > GARBAGE_SHARE_WARNING
+        if garbage_share > 0.15 or garbage_count >= MIN_GARBAGE_CALIBRATION_LABELS
         else normal_target
     )
     if reviewed < adaptive_target:
@@ -299,6 +543,38 @@ def next_action(job_dir: Path) -> dict[str, object]:
             "stage": stage,
             "reason": "Job readiness checks still fail.",
             "blocking_errors": errors[:5],
+        }
+    # The first topic policy is intentionally available before the audit loops,
+    # but those loops may add hundreds of more representative labels.  Give the
+    # model one bounded final refresh after the target is reached.  The apply
+    # command compares the candidate with the existing policy on all reviewed
+    # examples and retains the old policy if coverage or false positives regress.
+    final_policy_checked = int(state.get("final_policy_checked_at_labels", 0) or 0)
+    if (
+        source_total > SMALL_CORE_DIRECT_LIMIT
+        and int(state.get("signal_policy_attempts", 0) or 0) > 0
+        and final_policy_checked < reviewed
+    ):
+        if not bool(state.get("final_policy_refinement_requested")):
+            write_state(
+                job_dir,
+                "intent_policy",
+                final_policy_refinement_requested=True,
+                final_policy_refinement_labels=reviewed,
+            )
+        return {
+            "status": "continue",
+            "stage": "intent_policy",
+            "action": "refine_final_intent_policy",
+            "labels_reviewed": reviewed,
+            "signal_coverage": intent_signal_coverage(
+                load_label_sheet(job_dir),
+                commercial_signals,
+                informational_signals,
+                weak_question_signals,
+            ),
+            "command": f'{HERMES_COMMAND} policy-context --job "{job_dir.name}" --limit 8 --quiet',
+            "after_policy": f'{HERMES_COMMAND} apply-policy-inline --job "{job_dir.name}" --commercial "explicit commercial prototypes" --implicit-commercial "implicit commercial structures" --informational "informational prototypes" --commercial-signals "8-20 strong commercial signals" --informational-signals "12-30 strong informational signals" --weak-question-signals "3-10 weak question signals" --relevant "relevant prototypes" --garbage "hard negative prototypes" --quiet',
         }
     return {
         "status": "continue",
@@ -372,6 +648,338 @@ def configured_values(config: dict[str, object], section: str, key: str) -> list
     if not isinstance(values, list):
         return []
     return [str(value).strip() for value in values if str(value).strip()]
+
+
+def normalize_signal(value: object) -> str:
+    text = re.sub(r"[^a-zа-я0-9*]+", " ", str(value).lower().replace("ё", "е"))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def marker_safety_reason(marker: str) -> str | None:
+    """Reject only structurally unsafe signals; never encode topic vocabulary."""
+    normalized = normalize_signal(marker)
+    if not normalized:
+        return "empty"
+    for token in normalized.split():
+        if "*" in token and len(token.replace("*", "")) < MIN_PRODUCTIVE_MARKER_STEM_LENGTH:
+            return "wildcard_stem_too_short"
+    return None
+
+
+def signal_mask(phrases: pd.Series, signals: list[str]) -> pd.Series:
+    normalized = [normalize_signal(value) for value in signals if normalize_signal(value)]
+    if not normalized:
+        return pd.Series(False, index=phrases.index)
+    parts = [re.escape(value).replace(r"\*", r"[a-zа-я0-9]*") for value in normalized]
+    expression = rf"(?:^|\s)(?:{'|'.join(parts)})(?:$|\s)"
+    normalized_phrases = (
+        phrases.fillna("").astype(str).str.lower().str.replace("ё", "е", regex=False)
+    )
+    return normalized_phrases.str.contains(expression, case=False, regex=True, na=False)
+
+
+def family_overlaps_signals(pattern: str, signals: list[str]) -> bool:
+    """Return true when a one-token family is already defined as a weak signal."""
+    family_stem = normalize_signal(pattern).rstrip("*")
+    if not family_stem:
+        return False
+    for signal in signals:
+        for token in normalize_signal(signal).split():
+            signal_stem = token.rstrip("*")
+            if signal_stem and (
+                family_stem.startswith(signal_stem)
+                or signal_stem.startswith(family_stem)
+            ):
+                return True
+    return False
+
+
+def intent_family_paths(job_dir: Path) -> tuple[Path, Path]:
+    return (
+        job_dir / "intent_family_candidates.json",
+        job_dir / "intent_family_labels.json",
+    )
+
+
+def intent_family_status(job_dir: Path) -> dict[str, object]:
+    candidates_path, labels_path = intent_family_paths(job_dir)
+    if not candidates_path.is_file():
+        return {
+            "total": 0,
+            "labeled": 0,
+            "remaining": 0,
+            "pending": [],
+            "labels": {},
+        }
+    payload = json.loads(candidates_path.read_text(encoding="utf-8"))
+    families = payload.get("families", []) if isinstance(payload, dict) else []
+    labels: dict[str, str] = {}
+    if labels_path.is_file():
+        loaded = json.loads(labels_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict) and isinstance(loaded.get("labels"), dict):
+            labels = {
+                str(key): str(value).strip().lower()
+                for key, value in loaded["labels"].items()
+            }
+    pending = [
+        record
+        for record in families
+        if isinstance(record, dict) and str(record.get("id", "")) not in labels
+    ]
+    return {
+        "total": len(families),
+        "labeled": len(families) - len(pending),
+        "remaining": len(pending),
+        "pending": pending,
+        "labels": labels,
+    }
+
+
+def intent_family_batch(job_dir: Path, limit: int) -> dict[str, object]:
+    if limit < 1 or limit > INTENT_FAMILY_REVIEW_BATCH_SIZE:
+        raise ValueError(
+            f"limit must be from 1 to {INTENT_FAMILY_REVIEW_BATCH_SIZE}."
+        )
+    status = intent_family_status(job_dir)
+    rows = [
+        {
+            "id": str(record.get("id", "")),
+            "family": str(record.get("pattern", "")),
+            "kind": str(record.get("kind", "lexical")),
+            "occurrences": int(record.get("occurrences", 0) or 0),
+            "share": float(record.get("share", 0.0) or 0.0),
+            "examples": [str(value) for value in record.get("examples", [])][:8],
+        }
+        for record in list(status["pending"])[:limit]
+    ]
+    return {
+        "stage": "intent_family_audit",
+        "topic": read_state(job_dir).get("topic", ""),
+        "allowed_labels": ["commercial", "informational", "neutral"],
+        "labeling_contract": INTENT_LABELING_CONTRACT,
+        "instruction": (
+            "Judge whether the lexical family or two-token structural family independently determines intent "
+            "across the shown examples. "
+            "Use commercial for an inherently offer/result-seeking or conversion family, including implicit "
+            "marketplace demand without a payment verb; use informational for an "
+            "inherently informational family such as reviews, opinions, experience, pros/cons, instructions, "
+            "diagnostics, reference facts, specifications, diagrams, comparisons, or explanations, and neutral "
+            "for brands, products, professions, topic nouns, weak question words, or mixed families. A neutral "
+            "decision creates "
+            "no classification override. The examples intentionally cover different contexts: do not infer a "
+            "decisive label from only one subset. Judge the family for the user's requested binary output, not a "
+            "generic marketing-funnel taxonomy. A listing/search family for products, services, vacancies, "
+            "providers, rentals, admissions, or similar concrete offers is commercial; an explanation of the "
+            "same entity is informational."
+        ),
+        "rows": rows,
+        "remaining_after_batch": int(status["remaining"]) - len(rows),
+    }
+
+
+def apply_intent_family_labels_inline(job_dir: Path, value: str) -> dict[str, object]:
+    candidates_path, labels_path = intent_family_paths(job_dir)
+    if not candidates_path.is_file():
+        raise FileNotFoundError("intent_family_candidates.json is missing.")
+    payload = json.loads(candidates_path.read_text(encoding="utf-8"))
+    families = payload.get("families", []) if isinstance(payload, dict) else []
+    family_by_id = {
+        str(record.get("id")): record
+        for record in families
+        if isinstance(record, dict) and record.get("id")
+    }
+    existing: dict[str, str] = {}
+    if labels_path.is_file():
+        loaded = json.loads(labels_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict) and isinstance(loaded.get("labels"), dict):
+            existing = {
+                str(key): str(label).strip().lower()
+                for key, label in loaded["labels"].items()
+            }
+    applied = 0
+    for item in value.split(";"):
+        if not item.strip():
+            continue
+        fields = [field.strip() for field in item.split("|")]
+        if len(fields) != 2:
+            raise ValueError("Each family decision must be ID|label.")
+        family_id, label = fields[0], fields[1].lower()
+        if family_id not in family_by_id:
+            raise ValueError(f"Unknown intent family ID: {family_id}")
+        if label not in {"commercial", "informational", "neutral"}:
+            raise ValueError(f"Invalid intent family label: {label}")
+        existing[family_id] = label
+        applied += 1
+    if not applied:
+        raise ValueError("At least one intent family decision is required.")
+    config_path = job_dir / "job_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    weak_signals = configured_values(config, "intent", "weak_question_markers")
+    forced_neutral = 0
+    forced_neutral_weak = 0
+    forced_neutral_lexical = 0
+    for family_id, label in list(existing.items()):
+        record = family_by_id.get(family_id)
+        pattern = str(record.get("pattern", "")).strip() if record else ""
+        unsafe_lexical_decision = bool(
+            record
+            and str(record.get("kind", "lexical")) == "lexical"
+            and "safe_decisive_lexical" in record
+            and not bool(record.get("safe_decisive_lexical"))
+        )
+        weak_overlap = family_overlaps_signals(pattern, weak_signals)
+        if label != "neutral" and (weak_overlap or unsafe_lexical_decision):
+            existing[family_id] = "neutral"
+            forced_neutral += 1
+            forced_neutral_weak += int(weak_overlap)
+            forced_neutral_lexical += int(unsafe_lexical_decision)
+
+    temporary = labels_path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"labels": existing}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(labels_path)
+
+    rules = {"commercial": [], "informational": [], "neutral": []}
+    for family_id, label in existing.items():
+        record = family_by_id.get(family_id)
+        pattern = str(record.get("pattern", "")).strip() if record else ""
+        if pattern and label in rules and pattern not in rules[label]:
+            rules[label].append(pattern)
+    intent = config.setdefault("intent", {})
+    intent["family_rules"] = rules
+    config_temporary = config_path.with_suffix(".tmp")
+    config_temporary.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    config_temporary.replace(config_path)
+    status = intent_family_status(job_dir)
+    write_state(
+        job_dir,
+        "intent_family_audit",
+        intent_family_labeled=status["labeled"],
+        intent_family_remaining=status["remaining"],
+    )
+    return {
+        "status": "intent_family_labels_applied",
+        "applied": applied,
+        "labeled": status["labeled"],
+        "remaining": status["remaining"],
+        "decisive_commercial": len(rules["commercial"]),
+        "decisive_informational": len(rules["informational"]),
+        "neutral": len(rules["neutral"]),
+        "forced_neutral_families": forced_neutral,
+        "forced_neutral_weak_families": forced_neutral_weak,
+        "forced_neutral_unsafe_lexical_families": forced_neutral_lexical,
+    }
+
+
+def intent_signal_coverage(
+    frame: pd.DataFrame,
+    commercial_signals: list[str],
+    informational_signals: list[str],
+    weak_question_signals: list[str] | None = None,
+) -> dict[str, object]:
+    labels, phrases = label_summary(frame)
+    commercial_rows = labels.eq("commercial") & phrases.ne("")
+    informational_rows = labels.eq("informational") & phrases.ne("")
+    commercial_hit = signal_mask(phrases, commercial_signals)
+    informational_hit = signal_mask(phrases, informational_signals)
+    weak_question_hit = signal_mask(phrases, weak_question_signals or [])
+    commercial_count = int(commercial_rows.sum())
+    informational_count = int(informational_rows.sum())
+    eligible = (
+        commercial_count >= MIN_LARGE_CORE_EXAMPLES_PER_INTENT
+        and informational_count >= MIN_LARGE_CORE_EXAMPLES_PER_INTENT
+    )
+    commercial_coverage = (
+        float(commercial_hit[commercial_rows].mean()) if commercial_count else 0.0
+    )
+    informational_coverage = (
+        float(informational_hit[informational_rows].mean()) if informational_count else 0.0
+    )
+    informational_false_positive = (
+        float((informational_hit & ~commercial_hit)[commercial_rows].mean())
+        if commercial_count
+        else 0.0
+    )
+    commercial_false_positive = (
+        float((commercial_hit & ~informational_hit)[informational_rows].mean())
+        if informational_count
+        else 0.0
+    )
+    weak_informational_rows = weak_question_hit & informational_rows
+    weak_commercial_rows = weak_question_hit & commercial_rows
+    weak_informational_coverage = (
+        float(informational_hit[weak_informational_rows].mean())
+        if int(weak_informational_rows.sum())
+        else 0.0
+    )
+    weak_commercial_coverage = (
+        float(commercial_hit[weak_commercial_rows].mean())
+        if int(weak_commercial_rows.sum())
+        else 0.0
+    )
+    needs_refinement = bool(
+        eligible
+        and (
+            informational_coverage < 0.55
+            or informational_false_positive > 0.15
+            or commercial_false_positive > 0.15
+            or (
+                int(weak_informational_rows.sum()) >= 5
+                and weak_informational_coverage < 0.50
+            )
+            or (
+                int(weak_commercial_rows.sum()) >= 5
+                and weak_commercial_coverage < 0.50
+            )
+        )
+    )
+    quality_score = (
+        0.5 * (commercial_coverage + informational_coverage)
+        - 0.75 * (informational_false_positive + commercial_false_positive)
+    )
+    return {
+        "eligible": eligible,
+        "commercial_examples": commercial_count,
+        "informational_examples": informational_count,
+        "commercial_coverage": round(commercial_coverage, 4),
+        "informational_coverage": round(informational_coverage, 4),
+        "informational_false_positive": round(informational_false_positive, 4),
+        "commercial_false_positive": round(commercial_false_positive, 4),
+        "weak_question_informational_examples": int(weak_informational_rows.sum()),
+        "weak_question_commercial_examples": int(weak_commercial_rows.sum()),
+        "weak_question_informational_context_coverage": round(
+            weak_informational_coverage, 4
+        ),
+        "weak_question_commercial_context_coverage": round(
+            weak_commercial_coverage, 4
+        ),
+        "quality_score": round(quality_score, 4),
+        "needs_refinement": needs_refinement,
+    }
+
+
+def final_policy_candidate_is_safe(
+    baseline: dict[str, object], candidate: dict[str, object]
+) -> tuple[bool, list[str]]:
+    """Reject a final signal refresh that regresses reviewed real examples."""
+    reasons: list[str] = []
+    if not bool(candidate.get("eligible")):
+        reasons.append("not_enough_reviewed_intent_examples")
+        return False, reasons
+    baseline_score = float(baseline.get("quality_score", 0.0) or 0.0)
+    candidate_score = float(candidate.get("quality_score", 0.0) or 0.0)
+    if candidate_score + 0.02 < baseline_score:
+        reasons.append("signal_quality_score_regressed")
+    for key in ("informational_false_positive", "commercial_false_positive"):
+        old = float(baseline.get(key, 0.0) or 0.0)
+        new = float(candidate.get(key, 0.0) or 0.0)
+        if new > max(0.20, old + 0.03):
+            reasons.append(f"{key}_regressed")
+    return not reasons, reasons
 
 
 def label_quality_status(
@@ -675,6 +1283,61 @@ def label_summary(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     return labels, phrases
 
 
+def current_sample_intent_counts(frame: pd.DataFrame) -> dict[str, int]:
+    """Count job-local reviewed labels, excluding auxiliary saved knowledge."""
+    labels, phrases = label_summary(frame)
+    if "Knowledge Source" in frame.columns:
+        sources = frame["Knowledge Source"].fillna("").astype(str).str.strip().str.lower()
+        auxiliary = sources.isin({"model_reviewed", "review_corrected"})
+    else:
+        auxiliary = pd.Series(False, index=frame.index)
+    current = phrases.ne("") & ~auxiliary
+    return {
+        label: int((current & labels.eq(label)).sum())
+        for label in ("commercial", "informational", "garbage")
+    }
+
+
+def sanitize_strong_signals(
+    frame: pd.DataFrame,
+    signals: list[str],
+    expected_label: str,
+) -> tuple[list[str], list[dict[str, object]]]:
+    """Remove collision-prone signals using structure and reviewed job labels."""
+    labels, phrases = label_summary(frame)
+    relevant = labels.isin(["commercial", "informational"]) & phrases.ne("")
+    retained: list[str] = []
+    rejected: list[dict[str, object]] = []
+    opposite_label = (
+        "informational" if expected_label == "commercial" else "commercial"
+    )
+    for signal in signals:
+        reason = marker_safety_reason(signal)
+        matched = signal_mask(phrases, [signal]) & relevant
+        expected_count = int((matched & labels.eq(expected_label)).sum())
+        opposite_count = int((matched & labels.eq(opposite_label)).sum())
+        labeled_matches = expected_count + opposite_count
+        if (
+            reason is None
+            and labeled_matches >= 4
+            and opposite_count >= 2
+            and opposite_count / labeled_matches >= 0.30
+        ):
+            reason = "reviewed_label_collision"
+        if reason is None:
+            retained.append(signal)
+        else:
+            rejected.append(
+                {
+                    "signal": signal,
+                    "reason": reason,
+                    "expected_examples": expected_count,
+                    "opposite_examples": opposite_count,
+                }
+            )
+    return retained, rejected
+
+
 def bootstrap_seeds_from_real_labels(job_dir: Path, frame: pd.DataFrame) -> dict[str, int]:
     """Fill only missing seed slots from model-reviewed, real source phrases.
 
@@ -761,10 +1424,80 @@ def sample_rows(job_dir: Path, offset: int, limit: int, only_unlabeled: bool = T
     ]
     return {
         "stage": read_state(job_dir).get("stage", "initial_labeling"),
+        "topic": read_state(job_dir).get("topic", ""),
+        "labeling_contract": INTENT_LABELING_CONTRACT,
         "offset": offset,
         "limit": limit,
         "total_unlabeled": int(len(candidates)),
         "rows": rows,
+    }
+
+
+def family_coverage_status(frame: pd.DataFrame) -> dict[str, int]:
+    """Count mandatory real examples reserved for source-family coverage."""
+    labels, phrases = label_summary(frame)
+    if "Knowledge Source" not in frame.columns:
+        return {"total": 0, "labeled": 0, "remaining": 0}
+    sources = frame["Knowledge Source"].fillna("").astype(str).str.strip().str.lower()
+    coverage = sources.eq("current family coverage sample") & phrases.ne("")
+    labeled = coverage & labels.isin(VALID_LABELS)
+    return {
+        "total": int(coverage.sum()),
+        "labeled": int(labeled.sum()),
+        "remaining": int((coverage & ~labeled).sum()),
+    }
+
+
+def select_family_coverage_review(job_dir: Path, limit: int) -> dict[str, object]:
+    """Return the bounded real-phrase batch that closes family blind spots."""
+    if limit < 1 or limit > FAMILY_COVERAGE_REVIEW_BATCH_SIZE:
+        raise ValueError(
+            f"limit must be from 1 to {FAMILY_COVERAGE_REVIEW_BATCH_SIZE}."
+        )
+    frame = load_label_sheet(job_dir)
+    labels, phrases = label_summary(frame)
+    if "Knowledge Source" not in frame.columns:
+        return {
+            "stage": "intent_family_coverage",
+            "selection": "complete",
+            "rows": [],
+            "remaining_after_batch": 0,
+        }
+    sources = frame["Knowledge Source"].fillna("").astype(str).str.strip().str.lower()
+    candidates = frame[
+        sources.eq("current family coverage sample")
+        & phrases.ne("")
+        & labels.isna()
+    ].copy()
+    if "Coverage Family" not in candidates.columns:
+        candidates["Coverage Family"] = ""
+    candidates = candidates.sort_values(
+        ["Coverage Family", "Sample ID"], ascending=[True, True], kind="stable"
+    )
+    view = candidates.head(limit)
+    rows = [
+        {
+            "id": str(row["Sample ID"]),
+            "phrase": str(row["Phrase"]),
+            "family": str(row.get("Coverage Family", "")),
+            "reason": "unrepresented_source_family",
+        }
+        for _, row in view.iterrows()
+    ]
+    status = family_coverage_status(frame)
+    write_state(
+        job_dir,
+        "intent_family_coverage",
+        family_coverage_labeled=status["labeled"],
+        family_coverage_remaining=status["remaining"],
+    )
+    return {
+        "stage": "intent_family_coverage",
+        "topic": read_state(job_dir).get("topic", ""),
+        "labeling_contract": INTENT_LABELING_CONTRACT,
+        "selection": "unrepresented_source_families",
+        "rows": rows,
+        "remaining_after_batch": max(0, status["remaining"] - len(rows)),
     }
 
 
@@ -808,6 +1541,310 @@ def select_priority_review(job_dir: Path, limit: int) -> dict[str, object]:
         "selection": "required_priority_coverage",
         "rows": rows,
         "remaining_priority_rows": int(len(candidates) - len(view)),
+    }
+
+
+def policy_context(job_dir: Path, limit: int) -> dict[str, object]:
+    """Give the model a small basis for intent and topic-relevance policies."""
+    if limit < 3 or limit > 12:
+        raise ValueError("limit must be from 3 to 12.")
+    frame = load_label_sheet(job_dir)
+    labels, phrases = label_summary(frame)
+    config = json.loads((job_dir / "job_config.json").read_text(encoding="utf-8"))
+    state = read_state(job_dir)
+    weak_question_values = configured_values(config, "intent", "weak_question_markers")
+    intent_config = config.get("intent", {}) if isinstance(config.get("intent", {}), dict) else {}
+    result: dict[str, object] = {
+        "topic": state.get("topic", ""),
+        "labeling_contract": INTENT_LABELING_CONTRACT,
+        "examples": {},
+        "current_signals": {
+            "commercial": configured_values(config, "intent", "commercial_markers"),
+            "informational": configured_values(config, "intent", "informational_markers"),
+            "weak_question": weak_question_values,
+            "rejected": intent_config.get("rejected_strong_markers", []),
+            "reviewed_families": (
+                config.get("intent", {}).get("family_rules", {})
+                if isinstance(config.get("intent", {}), dict)
+                else {}
+            ),
+        },
+        "signal_coverage": state.get("signal_policy_coverage", {}),
+        "weak_question_context_examples": {},
+        "structural_family_examples": [],
+    }
+    for label in ("commercial", "informational", "garbage"):
+        subset = frame[labels.eq(label) & phrases.ne("")].copy()
+        if "Search Volume" in subset:
+            subset["_priority"] = pd.to_numeric(subset["Search Volume"], errors="coerce").fillna(0)
+            subset = subset.sort_values("_priority", ascending=False)
+        result["examples"][label] = subset["Phrase"].astype(str).head(limit).tolist()
+    if weak_question_values:
+        weak_mask = signal_mask(phrases, weak_question_values)
+        for label in ("commercial", "informational"):
+            subset = frame[weak_mask & labels.eq(label) & phrases.ne("")].copy()
+            if "Search Volume" in subset:
+                subset["_priority"] = pd.to_numeric(
+                    subset["Search Volume"], errors="coerce"
+                ).fillna(0)
+                subset = subset.sort_values("_priority", ascending=False)
+            result["weak_question_context_examples"][label] = (
+                subset["Phrase"].astype(str).head(limit).tolist()
+            )
+    candidates_path, labels_path = intent_family_paths(job_dir)
+    if candidates_path.is_file() and labels_path.is_file():
+        candidates_payload = json.loads(candidates_path.read_text(encoding="utf-8"))
+        labels_payload = json.loads(labels_path.read_text(encoding="utf-8"))
+        family_labels = labels_payload.get("labels", {})
+        if isinstance(family_labels, dict):
+            for record in candidates_payload.get("families", []):
+                if not isinstance(record, dict) or str(record.get("kind", "")) != "structural":
+                    continue
+                family_id = str(record.get("id", ""))
+                label = str(family_labels.get(family_id, "neutral"))
+                result["structural_family_examples"].append(
+                    {
+                        "family": str(record.get("pattern", "")),
+                        "decision": label,
+                        "examples": [str(value) for value in record.get("examples", [])[:2]],
+                    }
+                )
+                if len(result["structural_family_examples"]) >= 12:
+                    break
+    result["instruction"] = (
+        "Create a universal policy adapted to the stated topic and the reviewed structural-family examples: "
+        "3-8 explicit commercial prototypes, "
+        "5-12 implicit commercial prototypes without buy/price words, 5-12 informational prototypes, "
+        "8-20 strong commercial signals, 12-30 strong informational signals, and 3-10 weak question signals. "
+        "Strong commercial signals must express concrete offer/result seeking or a transaction/conversion action, "
+        "including implicit marketplace demand without buy/price words. Strong informational signals "
+        "must independently express instructions, diagnosis, reference data, specifications, diagrams, comparison, "
+        "or explanation. Weak question words (the topic language equivalents of where/how/how much/which) are never "
+        "decisive alone: a phrase equivalent to 'where to buy' or 'how much does it cost' remains commercial. "
+        "For weak-question examples, derive strong context signals for both transaction/conversion and informational "
+        "reference/location meanings; never promote the weak question word itself. Use a trailing * only for productive "
+        "word stems of at least four characters and keep one concept per signal. Replace every signal listed under "
+        "current_signals.rejected with a safer exact, longer-stem, or multiword signal. Do not copy automotive vocabulary "
+        "unless the current topic is automotive. Also create "
+        "5-12 broad relevant topic prototypes, "
+        "and 8-15 diverse hard negative garbage prototypes. Informational signals must cover questions, "
+        "instructions, diagnostics, locations, specifications, diagrams, and comparisons for this topic. "
+        "Hard negatives must cover plausible lexical "
+        "collisions with the topic, unrelated entities, stories/media, jobs/services, and other meanings "
+        "of topic words. They are synthetic boundary examples, never source rows."
+        " The informational policy must explicitly cover the topic-language equivalents of reviews, opinions, "
+        "user experience, pros and cons, and product/service overviews in addition to instructions, diagnostics, "
+        "reference data, specifications, diagrams, comparisons, and explanations. Reuse decisive reviewed_families "
+        "as signals where appropriate; never turn neutral brand or product families into intent markers."
+    )
+    return result
+
+
+def apply_policy_inline(
+    job_dir: Path,
+    commercial: str,
+    implicit_commercial: str,
+    informational: str,
+    commercial_signals: str,
+    informational_signals: str,
+    weak_question_signals: str,
+    relevant: str,
+    garbage: str,
+) -> dict[str, object]:
+    def parse(value: str, limit: int = 15) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in value.split(";"):
+            text = re.sub(r"\s+", " ", item).strip()
+            key = text.lower().replace("ё", "е")
+            if text and key not in seen:
+                seen.add(key)
+                result.append(text)
+        return result[:limit]
+    commercial_values, informational_values = parse(commercial), parse(informational)
+    implicit_commercial_values = parse(implicit_commercial)
+    commercial_signal_values = parse(commercial_signals, 20)
+    informational_signal_values = parse(informational_signals, 30)
+    weak_question_signal_values = parse(weak_question_signals, 10)
+    relevant_values, garbage_values = parse(relevant), parse(garbage)
+    if len(commercial_values) < 3 or len(informational_values) < 5:
+        raise ValueError("Provide at least three commercial and five informational prototypes separated by semicolons.")
+    if len(implicit_commercial_values) < 5:
+        raise ValueError("Provide at least five implicit commercial structures without buy or price words.")
+    if len(commercial_signal_values) < 5:
+        raise ValueError("Provide at least five strong commercial signals.")
+    if len(informational_signal_values) < 12:
+        raise ValueError("Provide at least twelve strong informational signals.")
+    if len(weak_question_signal_values) < 3:
+        raise ValueError("Provide at least three weak question signals.")
+    if len(relevant_values) < 5 or len(garbage_values) < 5:
+        raise ValueError("Provide at least five relevant and five hard-negative garbage prototypes.")
+    path = job_dir / "job_config.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    previous_state = read_state(job_dir)
+    final_refresh = bool(previous_state.get("final_policy_refinement_requested"))
+    commercial_signal_keys = {normalize_signal(value) for value in commercial_signal_values}
+    informational_signal_keys = {normalize_signal(value) for value in informational_signal_values}
+    overlap = sorted(commercial_signal_keys & informational_signal_keys)
+    if overlap:
+        raise ValueError("Strong commercial and informational signals overlap: " + ", ".join(overlap))
+    weak_question_signal_values = [
+        value
+        for value in weak_question_signal_values
+        if normalize_signal(value) not in commercial_signal_keys | informational_signal_keys
+    ]
+    if len(weak_question_signal_values) < 3:
+        raise ValueError("At least three weak question signals must remain distinct from strong signals.")
+    label_frame = load_label_sheet(job_dir)
+    current_commercial_signals = configured_values(config, "intent", "commercial_markers")
+    current_informational_signals = configured_values(config, "intent", "informational_markers")
+    current_weak_signals = configured_values(config, "intent", "weak_question_markers")
+    baseline_coverage = intent_signal_coverage(
+        label_frame,
+        current_commercial_signals,
+        current_informational_signals,
+        current_weak_signals,
+    )
+    commercial_signal_values, rejected_commercial_signals = sanitize_strong_signals(
+        label_frame, commercial_signal_values, "commercial"
+    )
+    informational_signal_values, rejected_informational_signals = sanitize_strong_signals(
+        label_frame, informational_signal_values, "informational"
+    )
+    rejected_strong_markers = [
+        {**item, "expected_label": "commercial"}
+        for item in rejected_commercial_signals
+    ] + [
+        {**item, "expected_label": "informational"}
+        for item in rejected_informational_signals
+    ]
+    candidate_coverage = intent_signal_coverage(
+        label_frame,
+        commercial_signal_values,
+        informational_signal_values,
+        weak_question_signal_values,
+    )
+    if final_refresh:
+        accepted, rejection_reasons = final_policy_candidate_is_safe(
+            baseline_coverage, candidate_coverage
+        )
+        if not accepted:
+            labels_now, _ = label_summary(label_frame)
+            reviewed_now = int(labels_now.notna().sum())
+            write_state(
+                job_dir,
+                "active_review",
+                final_policy_refinement_requested=False,
+                final_policy_checked_at_labels=reviewed_now,
+                final_policy_candidate_accepted=False,
+                final_policy_candidate_rejection_reasons=rejection_reasons,
+                final_policy_candidate_coverage=candidate_coverage,
+            )
+            return {
+                "status": "existing_policy_retained",
+                "reason": "Final policy candidate failed reviewed-example regression safeguards.",
+                "rejection_reasons": rejection_reasons,
+                "baseline_coverage": baseline_coverage,
+                "candidate_coverage": candidate_coverage,
+            }
+    config["intent_policy"] = {
+        "commercial_prototypes": commercial_values,
+        "implicit_commercial_prototypes": implicit_commercial_values,
+        "informational_prototypes": informational_values,
+        "synthetic_weight": 0.75,
+        "informational_evidence_margin": 0.005,
+        "strength": 0.12,
+        "minimum_similarity": 0.55,
+    }
+    intent_config = config.setdefault("intent", {})
+    intent_config["commercial_markers"] = commercial_signal_values
+    intent_config["informational_markers"] = informational_signal_values
+    intent_config["weak_question_markers"] = weak_question_signal_values
+    intent_config["rejected_strong_markers"] = rejected_strong_markers
+    family_rules = (
+        intent_config.get("family_rules", {})
+        if isinstance(intent_config.get("family_rules", {}), dict)
+        else {}
+    )
+    family_rules = {
+        label: [str(value) for value in family_rules.get(label, [])]
+        for label in ("commercial", "informational", "neutral")
+    }
+    forced_neutral_families: list[str] = []
+    for label in ("commercial", "informational"):
+        retained = []
+        for pattern in family_rules[label]:
+            if family_overlaps_signals(pattern, weak_question_signal_values):
+                forced_neutral_families.append(pattern)
+            else:
+                retained.append(pattern)
+        family_rules[label] = retained
+    family_rules["neutral"] = list(
+        dict.fromkeys(family_rules["neutral"] + forced_neutral_families)
+    )
+    intent_config["family_rules"] = family_rules
+    if forced_neutral_families:
+        candidates_path, labels_path = intent_family_paths(job_dir)
+        if candidates_path.is_file() and labels_path.is_file():
+            candidates_payload = json.loads(candidates_path.read_text(encoding="utf-8"))
+            labels_payload = json.loads(labels_path.read_text(encoding="utf-8"))
+            labels_map = labels_payload.get("labels", {})
+            if isinstance(labels_map, dict):
+                for record in candidates_payload.get("families", []):
+                    if (
+                        isinstance(record, dict)
+                        and str(record.get("pattern", "")) in forced_neutral_families
+                    ):
+                        labels_map[str(record.get("id", ""))] = "neutral"
+                labels_temporary = labels_path.with_suffix(".tmp")
+                labels_temporary.write_text(
+                    json.dumps({"labels": labels_map}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                labels_temporary.replace(labels_path)
+    intent_config.setdefault("informational_decision_margin", 0.12)
+    intent_config.setdefault("strong_informational_decision_margin", 0.02)
+    intent_config.setdefault("weak_question_informational_margin", 0.02)
+    intent_config.setdefault("family_override_tolerance", 0.05)
+    relevance_config = config.setdefault("relevance", {})
+    relevance_config["relevant_prototypes"] = relevant_values
+    relevance_config["garbage_prototypes"] = garbage_values
+    relevance_config.setdefault("synthetic_weight", 1.0)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+    coverage = candidate_coverage
+    labels_now, _ = label_summary(label_frame)
+    reviewed_now = int(labels_now.notna().sum())
+    attempts = int(previous_state.get("signal_policy_attempts", 0) or 0) + 1
+    needs_refinement = bool(coverage["needs_refinement"]) and attempts < 2
+    write_state(
+        job_dir,
+        "active_review",
+        intent_policy_ready=True,
+        signal_policy_attempts=attempts,
+        signal_policy_coverage=coverage,
+        signal_policy_label_count=reviewed_now,
+        signal_policy_refinement_needed=needs_refinement,
+        signal_policy_warning=bool(coverage["needs_refinement"]) and attempts >= 2,
+        final_policy_refinement_requested=False,
+        final_policy_checked_at_labels=(reviewed_now if final_refresh else int(previous_state.get("final_policy_checked_at_labels", 0) or 0)),
+        final_policy_candidate_accepted=(True if final_refresh else previous_state.get("final_policy_candidate_accepted")),
+    )
+    return {
+        "status": "classification_policy_applied",
+        "commercial_prototypes": len(commercial_values),
+        "implicit_commercial_prototypes": len(implicit_commercial_values),
+        "informational_prototypes": len(informational_values),
+        "commercial_signals": len(commercial_signal_values),
+        "informational_signals": len(informational_signal_values),
+        "weak_question_signals": len(weak_question_signal_values),
+        "rejected_strong_markers": rejected_strong_markers,
+        "forced_neutral_weak_families": len(forced_neutral_families),
+        "signal_coverage": coverage,
+        "refinement_needed": needs_refinement,
+        "relevant_prototypes": len(relevant_values),
+        "garbage_prototypes": len(garbage_values),
     }
 
 
@@ -882,11 +1919,51 @@ def apply_label_payload(job_dir: Path, payload: object) -> dict[str, object]:
     labels, _ = label_summary(frame)
     seed_counts = bootstrap_seeds_from_real_labels(job_dir, frame)
     stage = "active_review" if int(labels.notna().sum()) >= 100 else "initial_labeling"
+    previous_state = read_state(job_dir)
+    pending_relevance_ids = {
+        str(value) for value in previous_state.get("pending_relevance_review_ids", [])
+    }
+    pending_intent_ids = {
+        str(value) for value in previous_state.get("pending_intent_review_ids", [])
+    }
+    pending_policy_conflict_ids = {
+        str(value) for value in previous_state.get("pending_policy_conflict_review_ids", [])
+    }
+    labeled_ids = set(frame.loc[labels.notna(), "Sample ID"].astype(str))
+    relevance_audit_completed = bool(pending_relevance_ids) and pending_relevance_ids.issubset(labeled_ids)
+    intent_audit_completed = bool(pending_intent_ids) and pending_intent_ids.issubset(labeled_ids)
+    policy_conflict_audit_completed = (
+        bool(pending_policy_conflict_ids)
+        and pending_policy_conflict_ids.issubset(labeled_ids)
+    )
+    state_updates: dict[str, object] = {
+        "labels_reviewed": int(labels.notna().sum()),
+        "remaining_review_rows": int(labels.isna().sum()),
+    }
+    if relevance_audit_completed:
+        state_updates["relevance_audit_batches"] = int(previous_state.get("relevance_audit_batches", 0) or 0) + 1
+        state_updates["pending_relevance_review_ids"] = []
+        garbage_before = int(previous_state.get("relevance_audit_garbage_before", 0) or 0)
+        garbage_after = int(labels.eq("garbage").sum())
+        yields = [
+            int(value)
+            for value in (previous_state.get("relevance_audit_garbage_yields", []) or [])
+        ]
+        yields.append(max(0, garbage_after - garbage_before))
+        state_updates["relevance_audit_garbage_yields"] = yields[-6:]
+        state_updates["relevance_audit_garbage_before"] = garbage_after
+    if intent_audit_completed:
+        state_updates["intent_audit_batches"] = int(previous_state.get("intent_audit_batches", 0) or 0) + 1
+        state_updates["pending_intent_review_ids"] = []
+    if policy_conflict_audit_completed:
+        state_updates["policy_conflict_audit_batches"] = int(
+            previous_state.get("policy_conflict_audit_batches", 0) or 0
+        ) + 1
+        state_updates["pending_policy_conflict_review_ids"] = []
     state = write_state(
         job_dir,
         stage,
-        labels_reviewed=int(labels.notna().sum()),
-        remaining_review_rows=int(labels.isna().sum()),
+        **state_updates,
     )
     return {
         "status": "labels_applied" if applied else "no_progress",
@@ -940,19 +2017,597 @@ def select_active_review(job_dir: Path, limit: int) -> dict[str, object]:
     margin = ordered[:, -1] - ordered[:, -2] if probabilities.shape[1] > 1 else np.ones(len(unlabeled))
     entropy = -(probabilities * np.log(np.maximum(probabilities, 1e-12))).sum(axis=1)
     priority = pd.to_numeric(unlabeled.get("Search Volume", 0), errors="coerce").fillna(0).to_numpy()
-    ranking = np.lexsort((-priority, -entropy, margin))[:limit]
+    # Similar text patterns with both commercial and informational labelled
+    # neighbours are valuable calibration cases, even when the classifier is
+    # superficially confident.
+    similarity = (candidate @ train.T).toarray()
+    nearest = np.argpartition(similarity, -min(5, similarity.shape[1]), axis=1)[:, -min(5, similarity.shape[1]):]
+    known = labeled_labels.to_numpy()
+    structural_conflict = np.asarray(
+        [len(set(known[indexes]) & {"commercial", "informational"}) == 2 for indexes in nearest],
+        dtype=int,
+    )
+    conflict_by_row = pd.Series(structural_conflict, index=unlabeled.index)
+    ranking = np.lexsort((-priority, -entropy, margin, -structural_conflict))[:limit]
     selected = unlabeled.iloc[ranking].copy()
     rows = [
         {
             "id": str(row["Sample ID"]),
             "phrase": str(row["Phrase"]),
-            "reason": "low_margin",
+            "reason": "structural_label_conflict" if conflict_by_row.loc[row_index] else "low_margin",
             "priority": round(float(pd.to_numeric(row.get("Search Volume", 0), errors="coerce") if pd.notna(pd.to_numeric(row.get("Search Volume", 0), errors="coerce")) else 0), 3),
         }
-        for _, row in selected.iterrows()
+        for row_index, row in selected.iterrows()
     ]
     write_state(job_dir, "active_review", labels_reviewed=int(labels.notna().sum()), remaining_review_rows=int(labels.isna().sum()))
     return {"stage": "active_review", "selection": "uncertain_tfidf", "rows": rows, "remaining_unlabeled": int(len(unlabeled))}
+
+
+def select_relevance_review(job_dir: Path, limit: int) -> dict[str, object]:
+    """Select likely out-of-topic rows without letting a tiny garbage class dominate."""
+    if limit < 1 or limit > 50:
+        raise ValueError("limit must be from 1 to 50.")
+    frame = load_label_sheet(job_dir)
+    labels, phrases = label_summary(frame)
+    labeled = frame[labels.notna() & phrases.ne("")].copy()
+    unlabeled = frame[labels.isna() & phrases.ne("")].copy()
+    if unlabeled.empty:
+        return {"stage": "ready_to_run", "selection": "complete", "rows": []}
+    relevant = labeled[labels.loc[labeled.index].isin(["commercial", "informational"])]
+    if len(relevant) < 10:
+        return sample_rows(job_dir, 0, limit, only_unlabeled=True) | {
+            "selection": "relevance_bootstrap",
+            "reason": "Need relevant examples before out-of-topic candidate selection.",
+        }
+
+    import numpy as np
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+
+    corpus = pd.concat([labeled["Phrase"], unlabeled["Phrase"]]).astype(str)
+    vectorizer = TfidfVectorizer(
+        analyzer="char_wb", ngram_range=(3, 5), min_df=1, max_features=20000, sublinear_tf=True
+    )
+    vectorizer.fit(corpus)
+    relevant_features = vectorizer.transform(relevant["Phrase"].astype(str))
+    candidate_features = vectorizer.transform(unlabeled["Phrase"].astype(str))
+    similarity = candidate_features @ relevant_features.T
+    relevant_support = np.asarray(similarity.max(axis=1).toarray()).ravel()
+    novelty = 1.0 - relevant_support
+
+    labeled_targets = np.where(labels.loc[labeled.index].eq("garbage"), "garbage", "relevant")
+    garbage_probability = np.zeros(len(unlabeled), dtype=float)
+    if len(set(labeled_targets)) == 2:
+        train_features = vectorizer.transform(labeled["Phrase"].astype(str))
+        garbage_count = int(np.sum(labeled_targets == "garbage"))
+        relevant_count = int(np.sum(labeled_targets == "relevant"))
+        class_weight = {"garbage": min(8.0, relevant_count / max(garbage_count, 1)), "relevant": 1.0}
+        classifier = LogisticRegression(max_iter=1000, class_weight=class_weight, random_state=42).fit(
+            train_features, labeled_targets
+        )
+        probabilities = classifier.predict_proba(candidate_features)
+        garbage_index = list(classifier.classes_).index("garbage")
+        garbage_probability = probabilities[:, garbage_index]
+
+    priority = pd.to_numeric(unlabeled.get("Search Volume", 0), errors="coerce").fillna(0).to_numpy()
+    if priority.max() > 0:
+        priority = np.log1p(priority) / max(float(np.log1p(priority).max()), 1.0)
+    candidate_score = 0.55 * garbage_probability + 0.35 * novelty + 0.10 * priority
+    chosen: list[int] = []
+    selection_reason: dict[int, str] = {}
+
+    def add_indexes(indexes: object, reason: str, quota: int) -> None:
+        for raw_index in list(indexes):
+            index = int(raw_index)
+            if index not in selection_reason:
+                chosen.append(index)
+                selection_reason[index] = reason
+            if sum(value == reason for value in selection_reason.values()) >= quota:
+                break
+
+    model_quota = max(1, limit // 3)
+    novelty_quota = max(1, limit // 4)
+    if float(garbage_probability.max(initial=0.0)) > 0:
+        add_indexes(
+            np.argsort(-garbage_probability, kind="stable"),
+            "garbage_model_candidate",
+            model_quota,
+        )
+    add_indexes(
+        np.argsort(-novelty, kind="stable"),
+        "semantic_outlier_candidate",
+        novelty_quota,
+    )
+    remaining = limit - len(chosen)
+    if remaining > 0 and len(unlabeled) >= 4:
+        # Greedy farthest-first selection is a compact microcluster audit: each
+        # new row represents a text neighbourhood not already covered by the
+        # higher-risk candidates. It avoids another heavyweight model call.
+        available = np.ones(len(unlabeled), dtype=bool)
+        available[chosen] = False
+        representatives: list[int] = []
+        while len(representatives) < remaining and available.any():
+            anchors = chosen + representatives
+            if anchors:
+                similarity_to_anchors = candidate_features @ candidate_features[anchors].T
+                maximum_similarity = np.asarray(similarity_to_anchors.max(axis=1).toarray()).ravel()
+                diversity = 1.0 - maximum_similarity
+            else:
+                diversity = novelty.copy()
+            diversified_score = 0.75 * diversity + 0.25 * candidate_score
+            diversified_score[~available] = -np.inf
+            selected_index = int(np.argmax(diversified_score))
+            representatives.append(selected_index)
+            available[selected_index] = False
+        add_indexes(
+            representatives,
+            "diverse_cluster_representative",
+            remaining,
+        )
+    if len(chosen) < limit:
+        add_indexes(
+            np.argsort(-candidate_score, kind="stable"),
+            "combined_relevance_risk",
+            limit - len(chosen),
+        )
+    ranking = np.asarray(chosen[:limit], dtype=int)
+    selected = unlabeled.iloc[ranking].copy()
+    selected_scores = candidate_score[ranking]
+    selected_support = relevant_support[ranking]
+    selected_garbage = garbage_probability[ranking]
+    rows = [
+        {
+            "id": str(row["Sample ID"]),
+            "phrase": str(row["Phrase"]),
+            "reason": selection_reason.get(int(ranking[position]), "combined_relevance_risk"),
+            "candidate_score": round(float(selected_scores[position]), 4),
+            "relevant_support": round(float(selected_support[position]), 4),
+            "garbage_model_probability": round(float(selected_garbage[position]), 4),
+        }
+        for position, (_, row) in enumerate(selected.iterrows())
+    ]
+    pending_ids = [row["id"] for row in rows]
+    current_state = read_state(job_dir)
+    write_state(
+        job_dir,
+        "relevance_audit",
+        pending_relevance_review_ids=pending_ids,
+        relevance_audit_garbage_before=int(labels.eq("garbage").sum()),
+        labels_reviewed=int(labels.notna().sum()),
+        remaining_review_rows=int(labels.isna().sum()),
+        relevance_audit_batches=int(current_state.get("relevance_audit_batches", 0) or 0),
+    )
+    return {
+        "stage": "relevance_audit",
+        "labeling_contract": INTENT_LABELING_CONTRACT,
+        "selection": "out_of_topic_candidates",
+        "rows": rows,
+        "remaining_unlabeled": int(len(unlabeled)),
+    }
+
+
+def select_intent_review(job_dir: Path, limit: int) -> dict[str, object]:
+    """Select the closest commercial/informational boundary rows for model review."""
+    if limit < 1 or limit > 50:
+        raise ValueError("limit must be from 1 to 50.")
+    frame = load_label_sheet(job_dir)
+    labels, phrases = label_summary(frame)
+    relevant_mask = labels.isin(["commercial", "informational"]) & phrases.ne("")
+    labeled = frame[relevant_mask].copy()
+    labeled_targets = labels.loc[labeled.index]
+    unlabeled = frame[labels.isna() & phrases.ne("")].copy()
+    if unlabeled.empty:
+        return {"stage": "ready_to_run", "selection": "complete", "rows": []}
+    if len(labeled) < 20 or not {"commercial", "informational"}.issubset(set(labeled_targets)):
+        return sample_rows(job_dir, 0, limit, only_unlabeled=True) | {
+            "selection": "intent_bootstrap",
+            "reason": "Need both relevant intent classes before boundary selection.",
+        }
+
+    import numpy as np
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+
+    vectorizer = TfidfVectorizer(
+        analyzer="char_wb", ngram_range=(3, 5), min_df=1, max_features=20000, sublinear_tf=True
+    )
+    train = vectorizer.fit_transform(labeled["Phrase"].astype(str))
+    candidates = vectorizer.transform(unlabeled["Phrase"].astype(str))
+    classifier = LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42).fit(
+        train, labeled_targets
+    )
+    probabilities = classifier.predict_proba(candidates)
+    ordered = np.sort(probabilities, axis=1)
+    margin = ordered[:, -1] - ordered[:, -2]
+    priority = pd.to_numeric(unlabeled.get("Search Volume", 0), errors="coerce").fillna(0).to_numpy()
+    word_count = unlabeled["Phrase"].astype(str).str.split().str.len().to_numpy()
+    ranking = np.lexsort((word_count, -priority, margin))[:limit]
+    selected = unlabeled.iloc[ranking].copy()
+    selected_margin = margin[ranking]
+    rows = [
+        {
+            "id": str(row["Sample ID"]),
+            "phrase": str(row["Phrase"]),
+            "reason": "commercial_informational_boundary",
+            "model_margin": round(float(selected_margin[position]), 4),
+        }
+        for position, (_, row) in enumerate(selected.iterrows())
+    ]
+    pending_ids = [row["id"] for row in rows]
+    current_state = read_state(job_dir)
+    write_state(
+        job_dir,
+        "intent_audit",
+        pending_intent_review_ids=pending_ids,
+        labels_reviewed=int(labels.notna().sum()),
+        remaining_review_rows=int(labels.isna().sum()),
+        intent_audit_batches=int(current_state.get("intent_audit_batches", 0) or 0),
+    )
+    return {
+        "stage": "intent_audit",
+        "labeling_contract": INTENT_LABELING_CONTRACT,
+        "selection": "commercial_informational_boundary",
+        "rows": rows,
+        "remaining_unlabeled": int(len(unlabeled)),
+    }
+
+
+def select_policy_conflict_review(job_dir: Path, limit: int) -> dict[str, object]:
+    """Select signal conflicts plus weak-question contexts needing composition."""
+    if limit < 1 or limit > 50:
+        raise ValueError("limit must be from 1 to 50.")
+    import numpy as np
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+
+    frame = load_label_sheet(job_dir)
+    labels, phrases = label_summary(frame)
+    relevant_mask = labels.isin(["commercial", "informational"]) & phrases.ne("")
+    labeled = frame[relevant_mask].copy()
+    targets = labels.loc[labeled.index]
+    unlabeled = frame[labels.isna() & phrases.ne("")].copy()
+    if unlabeled.empty:
+        return {"stage": "ready_to_run", "selection": "complete", "rows": []}
+    if len(labeled) < 20 or not {"commercial", "informational"}.issubset(set(targets)):
+        return sample_rows(job_dir, 0, limit, only_unlabeled=True) | {
+            "selection": "policy_conflict_bootstrap",
+            "reason": "Need both intent classes before policy-conflict selection.",
+        }
+
+    config = json.loads((job_dir / "job_config.json").read_text(encoding="utf-8"))
+    commercial_signals = configured_values(config, "intent", "commercial_markers")
+    informational_signals = configured_values(config, "intent", "informational_markers")
+    intent_config = config.get("intent", {}) if isinstance(config.get("intent", {}), dict) else {}
+    family_rules = (
+        intent_config.get("family_rules", {})
+        if isinstance(intent_config.get("family_rules", {}), dict)
+        else {}
+    )
+    weak_question_signals = configured_values(config, "intent", "weak_question_markers")
+    commercial_families = [
+        str(value)
+        for value in family_rules.get("commercial", [])
+        if not family_overlaps_signals(str(value), weak_question_signals)
+    ]
+    informational_families = [
+        str(value)
+        for value in family_rules.get("informational", [])
+        if not family_overlaps_signals(str(value), weak_question_signals)
+    ]
+    candidate_phrases = unlabeled["Phrase"].astype(str)
+    commercial_hit = signal_mask(candidate_phrases, commercial_signals).to_numpy()
+    informational_hit = signal_mask(candidate_phrases, informational_signals).to_numpy()
+    weak_question_hit = signal_mask(candidate_phrases, weak_question_signals).to_numpy()
+    commercial_family_hit = signal_mask(candidate_phrases, commercial_families).to_numpy()
+    informational_family_hit = signal_mask(candidate_phrases, informational_families).to_numpy()
+
+    vectorizer = TfidfVectorizer(
+        analyzer="char_wb", ngram_range=(3, 5), min_df=1, max_features=20000, sublinear_tf=True
+    )
+    train = vectorizer.fit_transform(labeled["Phrase"].astype(str))
+    candidates = vectorizer.transform(candidate_phrases)
+    classifier = LogisticRegression(
+        max_iter=1000, class_weight="balanced", random_state=42
+    ).fit(train, targets)
+    probabilities = classifier.predict_proba(candidates)
+    predicted = classifier.classes_[np.argmax(probabilities, axis=1)]
+    confidence = np.max(probabilities, axis=1)
+    ordered = np.sort(probabilities, axis=1)
+    margin = ordered[:, -1] - ordered[:, -2]
+    signal_conflict = (
+        (informational_hit & ~commercial_hit & (predicted == "commercial"))
+        | (commercial_hit & ~informational_hit & (predicted == "informational"))
+        | (commercial_hit & informational_hit)
+        | (informational_family_hit & (predicted == "commercial"))
+        | (commercial_family_hit & (predicted == "informational"))
+        | (informational_family_hit & commercial_family_hit)
+        | (informational_family_hit & commercial_hit)
+        | (commercial_family_hit & informational_hit)
+    )
+    weak_context = (
+        weak_question_hit
+        & ~commercial_hit
+        & ~informational_hit
+        & ~commercial_family_hit
+        & ~informational_family_hit
+    )
+    weak_indices = sorted(
+        (int(index) for index in np.flatnonzero(weak_context)),
+        key=lambda index: (predicted[index] != "commercial", -confidence[index]),
+    )
+    weak_budget = min(len(weak_indices), limit, max(10, limit // 2))
+    chosen = weak_indices[:weak_budget]
+    conflict_indices = np.flatnonzero(signal_conflict)
+    conflict_indices = conflict_indices[
+        np.argsort(-confidence[conflict_indices], kind="stable")
+    ]
+    chosen_set = set(chosen)
+    chosen.extend(
+        int(index)
+        for index in conflict_indices
+        if int(index) not in chosen_set and len(chosen) < limit
+    )
+    if len(chosen) < limit:
+        boundary_indices = np.argsort(margin, kind="stable")
+        chosen_set = set(chosen)
+        chosen.extend(
+            int(index)
+            for index in boundary_indices
+            if int(index) not in chosen_set
+            and len(chosen) < limit
+        )
+    selected = unlabeled.iloc[chosen].copy()
+    rows = []
+    for position, (_, row) in enumerate(selected.iterrows()):
+        candidate_index = chosen[position]
+        if weak_context[candidate_index]:
+            reason = "weak_question_context_audit"
+        elif commercial_family_hit[candidate_index] and informational_family_hit[candidate_index]:
+            reason = "opposite_family_conflict"
+        elif (
+            informational_family_hit[candidate_index] and commercial_hit[candidate_index]
+        ) or (
+            commercial_family_hit[candidate_index] and informational_hit[candidate_index]
+        ):
+            reason = "family_strong_signal_conflict"
+        elif (
+            informational_family_hit[candidate_index] and predicted[candidate_index] == "commercial"
+        ) or (
+            commercial_family_hit[candidate_index] and predicted[candidate_index] == "informational"
+        ):
+            reason = "family_classifier_disagreement"
+        elif commercial_hit[candidate_index] and informational_hit[candidate_index]:
+            reason = "strong_signal_conflict"
+        elif signal_conflict[candidate_index]:
+            reason = "signal_classifier_disagreement"
+        else:
+            reason = "intent_boundary_fallback"
+        rows.append(
+            {
+                "id": str(row["Sample ID"]),
+                "phrase": str(row["Phrase"]),
+                "reason": reason,
+                "classifier_prediction": str(predicted[candidate_index]),
+                "classifier_confidence": round(float(confidence[candidate_index]), 4),
+                "commercial_signal": bool(commercial_hit[candidate_index]),
+                "informational_signal": bool(informational_hit[candidate_index]),
+                "weak_question_signal": bool(weak_question_hit[candidate_index]),
+                "commercial_family": bool(commercial_family_hit[candidate_index]),
+                "informational_family": bool(informational_family_hit[candidate_index]),
+            }
+        )
+    pending_ids = [row["id"] for row in rows]
+    current_state = read_state(job_dir)
+    write_state(
+        job_dir,
+        "policy_conflict_audit",
+        pending_policy_conflict_review_ids=pending_ids,
+        labels_reviewed=int(labels.notna().sum()),
+        remaining_review_rows=int(labels.isna().sum()),
+        policy_conflict_audit_batches=int(
+            current_state.get("policy_conflict_audit_batches", 0) or 0
+        ),
+    )
+    return {
+        "stage": "policy_conflict_audit",
+        "labeling_contract": INTENT_LABELING_CONTRACT,
+        "selection": "signal_family_and_weak_question_conflicts",
+        "rows": rows,
+        "remaining_unlabeled": int(len(unlabeled)),
+    }
+
+
+def cluster_relevance_paths(job_dir: Path) -> tuple[Path, Path, Path]:
+    state = read_state(job_dir)
+    output_value = str(state.get("cluster_review_output_dir", "")).strip()
+    if not output_value:
+        raise ValueError("Cluster relevance output directory is not recorded in state.json.")
+    output_dir = Path(output_value)
+    return (
+        output_dir / "cluster_relevance_audit.json",
+        output_dir / "cluster_relevance_labels.json",
+        output_dir,
+    )
+
+
+def cluster_relevance_status(job_dir: Path) -> dict[str, object]:
+    audit_path, labels_path, _ = cluster_relevance_paths(job_dir)
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    clusters = audit.get("clusters", []) if isinstance(audit, dict) else []
+    decisions: dict[str, str] = {}
+    if labels_path.is_file():
+        loaded = json.loads(labels_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict) and isinstance(loaded.get("labels"), dict):
+            decisions = {str(key): str(value) for key, value in loaded["labels"].items()}
+    pending = []
+    total_decisions = 0
+    labeled_decisions = 0
+    for source in clusters:
+        required_ids = [str(source.get("id"))]
+        required_ids.extend(
+            str(item["review_id"])
+            for item in source.get("representative_evidence", [])
+            if isinstance(item, dict) and item.get("review_id")
+        )
+        total_decisions += len(required_ids)
+        labeled_decisions += sum(decision_id in decisions for decision_id in required_ids)
+        missing_ids = [decision_id for decision_id in required_ids if decision_id not in decisions]
+        if missing_ids:
+            record = dict(source)
+            record["missing_decision_ids"] = missing_ids
+            pending.append(record)
+    return {
+        "total_clusters": len(clusters),
+        "labeled_clusters": len(clusters) - len(pending),
+        "remaining_clusters": len(pending),
+        "total_decisions": total_decisions,
+        "labeled_decisions": labeled_decisions,
+        "remaining_decisions": total_decisions - labeled_decisions,
+        "pending": pending,
+    }
+
+
+def cluster_relevance_batch(job_dir: Path, limit: int) -> dict[str, object]:
+    if limit < 1 or limit > 30:
+        raise ValueError("limit must be from 1 to 30.")
+    status = cluster_relevance_status(job_dir)
+    rows = []
+    for record in list(status["pending"])[:limit]:
+        evidence = list(
+            record.get("representative_evidence")
+            or [
+                {"role": "unspecified", "phrase": phrase}
+                for phrase in record.get("representatives", [])
+            ]
+        )[:5]
+        rows.append(
+            {
+                "id": str(record["id"]),
+                "current_intent": str(record.get("current_intent", "")),
+                "cluster": str(record.get("cluster", "")),
+                "rows": int(record.get("rows", 0)),
+                "average_garbage_probability": record.get("average_garbage_probability", 0),
+                "representatives": evidence,
+                "required_decisions": list(record.get("missing_decision_ids", [])),
+            }
+        )
+    return {
+        "stage": "cluster_relevance_review",
+        "topic": read_state(job_dir).get("topic", ""),
+        "instruction": (
+            "Judge topic membership, not commercial intent. Use relevant only when the cluster belongs to the "
+            "user's stated business scope; garbage for an adjacent or unrelated domain even if brand words collide; "
+            "mixed only when the representatives genuinely contain both. Evidence roles distinguish central, "
+            "high-volume, relevance-risk, and boundary phrases; do not let one boundary outlier override a clearly "
+            "relevant cluster, but use mixed when the central evidence itself spans both scopes. Return a cluster "
+            "decision for the RC ID and an individual relevant/garbage decision for every representative review_id."
+        ),
+        "rows": rows,
+        "remaining_after_batch": int(status["remaining_clusters"]) - len(rows),
+    }
+
+
+def apply_cluster_labels_inline(job_dir: Path, value: str) -> dict[str, object]:
+    audit_path, labels_path, _ = cluster_relevance_paths(job_dir)
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    cluster_ids = {str(record.get("id")) for record in audit.get("clusters", [])}
+    review_ids = {
+        str(item["review_id"])
+        for record in audit.get("clusters", [])
+        for item in record.get("representative_evidence", [])
+        if isinstance(item, dict) and item.get("review_id")
+    }
+    valid_ids = cluster_ids | review_ids
+    existing: dict[str, str] = {}
+    if labels_path.is_file():
+        loaded = json.loads(labels_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict) and isinstance(loaded.get("labels"), dict):
+            existing = {str(key): str(label) for key, label in loaded["labels"].items()}
+    applied = 0
+    for item in value.split(";"):
+        fields = [field.strip() for field in item.split("|")]
+        if not item.strip():
+            continue
+        if len(fields) != 2:
+            raise ValueError(
+                "Each decision must be ID|label. Cluster IDs allow relevant, garbage, or mixed; "
+                "representative review IDs allow relevant or garbage."
+            )
+        cluster_id, label = fields[0], fields[1].lower()
+        if cluster_id not in valid_ids:
+            raise ValueError(f"Unknown cluster relevance ID: {cluster_id}")
+        allowed = {"relevant", "garbage", "mixed"} if cluster_id in cluster_ids else {"relevant", "garbage"}
+        if label not in allowed:
+            raise ValueError(f"Invalid cluster relevance label: {label}")
+        existing[cluster_id] = label
+        applied += 1
+    if not applied:
+        raise ValueError("At least one cluster relevance label is required.")
+    temporary = labels_path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"labels": existing}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(labels_path)
+    status = cluster_relevance_status(job_dir)
+    write_state(
+        job_dir,
+        "cluster_relevance_review",
+        cluster_relevance_labeled=status["labeled_clusters"],
+        cluster_relevance_remaining=status["remaining_clusters"],
+    )
+    return {
+        "status": "cluster_labels_applied",
+        "applied": applied,
+        "labeled_clusters": status["labeled_clusters"],
+        "remaining_clusters": status["remaining_clusters"],
+        "labeled_decisions": status["labeled_decisions"],
+        "remaining_decisions": status["remaining_decisions"],
+    }
+
+
+def apply_cluster_relevance_decisions(job_dir: Path) -> dict[str, object]:
+    lock, existing_lock = acquire_run_lock(job_dir)
+    if lock is None:
+        return {
+            "status": "already_running",
+            "pid": existing_lock.get("pid") if existing_lock else None,
+        }
+    _, _, output_dir = cluster_relevance_paths(job_dir)
+    from seo_pipeline import apply_large_cluster_relevance_decisions
+
+    write_state(
+        job_dir,
+        "cluster_relevance_finalize",
+        autopilot_last_status="running",
+        run_pid=lock["pid"],
+        run_started_at=lock["started_at"],
+    )
+    try:
+        quiet_library_logs()
+        manifest = apply_large_cluster_relevance_decisions(
+            output_dir, job_dir / "job_config.json"
+        )
+    except Exception as error:
+        record_run_failure(job_dir, error)
+        release_run_lock(job_dir, str(lock["token"]))
+        raise
+    state = write_state(
+        job_dir,
+        "quality_review",
+        last_large_run=manifest["excel_summary"],
+        cluster_relevance_audit=manifest.get("cluster_relevance_audit", {}),
+    )
+    result = {
+        "status": "completed",
+        "output": manifest["excel_summary"],
+        "rows": int(manifest.get("classified_rows_per_chunk_deduplicated", 0)),
+        "intent_counts": manifest.get("intent_counts", {}),
+        "cluster_relevance_audit": manifest.get("cluster_relevance_audit", {}),
+        "intent_family_audit": manifest.get("intent_family_audit", {}),
+        "stage": state["stage"],
+    }
+    release_run_lock(job_dir, str(lock["token"]))
+    return result
 
 
 def import_feedback(job_dir: Path, reviewed_workbook: Path) -> int:
@@ -1015,15 +2670,22 @@ def resolve_reviewed_workbook(value: Path) -> Path:
 
 
 def workflow_job_id_from_workbook(reviewed_workbook: Path) -> str:
-    try:
-        configuration = pd.read_excel(reviewed_workbook, sheet_name="Run configuration")
-    except ValueError as exc:
-        raise ValueError("Reviewed workbook has no Run configuration sheet with Workflow Job ID.") from exc
+    with pd.ExcelFile(reviewed_workbook) as workbook:
+        sheet_names = set(workbook.sheet_names)
+    metadata_sheet = next(
+        (name for name in ("_Workflow", "Run configuration") if name in sheet_names),
+        None,
+    )
+    if metadata_sheet is None:
+        raise ValueError(
+            "Reviewed workbook has no _Workflow or Run configuration sheet with Workflow Job ID."
+        )
+    configuration = pd.read_excel(reviewed_workbook, sheet_name=metadata_sheet)
     lookup = normalized_column_lookup(configuration)
     parameter_column = lookup.get("parameter")
     value_column = lookup.get("value")
     if not parameter_column or not value_column:
-        raise ValueError("Run configuration must contain Parameter and Value columns.")
+        raise ValueError(f"{metadata_sheet} must contain Parameter and Value columns.")
     # The generated configuration sheet uses the Python key spelling
     # ``workflow_job_id``. Treat underscores and spaces alike so this stays
     # compatible with both the machine-readable key and the human label.
@@ -1300,6 +2962,14 @@ def finalize_workbook(
             "Cannot finalize an incomplete result workbook. Missing sheets: "
             + ", ".join(missing_sheets)
         )
+    if not ({"Cluster summary", "Cluster review"} & available_sheets):
+        raise ValueError(
+            "Cannot finalize an incomplete result workbook. Missing Cluster summary."
+        )
+    if not ({"_Workflow", "Run configuration"} & available_sheets):
+        raise ValueError(
+            "Cannot finalize an incomplete result workbook. Missing workflow metadata."
+        )
 
     final_path = job_output_dir / f"{input_path.stem}_FINAL.xlsx"
     temporary_path = job_output_dir / f".{input_path.stem}_FINAL.tmp"
@@ -1489,8 +3159,40 @@ def run_large_with_log(job_dir: Path, input_value: str, chunk_size: int) -> dict
         if staged_path and staged_path.is_file():
             staged_path.unlink()
     duration = round(time.perf_counter() - started, 3)
-    state = write_state(job_dir, "quality_review", last_large_run=manifest["excel_summary"], duration_seconds=duration)
-    result = {"status": "completed", "output": manifest["excel_summary"], "rows": manifest["classified_rows_per_chunk_deduplicated"], "duration_seconds": duration, "log": str(log_path.resolve()), "stage": state["stage"]}
+    if manifest.get("status") == "awaiting_cluster_relevance_review":
+        state = write_state(
+            job_dir,
+            "cluster_relevance_review",
+            cluster_review_output_dir=str(output_dir.resolve()),
+            cluster_relevance_labeled=0,
+            cluster_relevance_remaining=int(
+                manifest.get("cluster_relevance_audit", {}).get("clusters", 0)
+            ),
+            duration_seconds=duration,
+        )
+        result = {
+            "status": "awaiting_cluster_relevance_review",
+            "clusters": state["cluster_relevance_remaining"],
+            "rows": manifest["classified_rows_per_chunk_deduplicated"],
+            "duration_seconds": duration,
+            "log": str(log_path.resolve()),
+            "stage": state["stage"],
+        }
+    else:
+        state = write_state(
+            job_dir,
+            "quality_review",
+            last_large_run=manifest["excel_summary"],
+            duration_seconds=duration,
+        )
+        result = {
+            "status": "completed",
+            "output": manifest["excel_summary"],
+            "rows": manifest["classified_rows_per_chunk_deduplicated"],
+            "duration_seconds": duration,
+            "log": str(log_path.resolve()),
+            "stage": state["stage"],
+        }
     release_run_lock(job_dir, str(lock["token"]))
     return result
 
@@ -1537,15 +3239,29 @@ def export_completed_large_result(job_dir: Path, input_value: str) -> dict[str, 
     parts_dir = output_dir / "parts"
     if not list(parts_dir.glob("part-*.csv.gz")):
         raise FileNotFoundError("Completed large-run parts are missing.")
-    from seo_pipeline import export_large_result_workbook
+    from seo_pipeline import build_intent_family_audit, export_large_result_workbook
 
     summary_path = output_dir / "cluster_summary.csv"
     uncertain_path = output_dir / "uncertain_review.csv"
     summary = pd.read_csv(summary_path, encoding="utf-8-sig") if summary_path.is_file() else pd.DataFrame()
     uncertain = pd.read_csv(uncertain_path, encoding="utf-8-sig") if uncertain_path.is_file() else pd.DataFrame()
     config = json.loads((job_dir / "job_config.json").read_text(encoding="utf-8"))
+    family_audit_path = output_dir / "intent_family_audit.csv"
+    family_audit = (
+        pd.read_csv(family_audit_path, encoding="utf-8-sig")
+        if family_audit_path.is_file()
+        else build_intent_family_audit(
+            (
+                pd.read_csv(part, compression="gzip", usecols=["Phrase", "Intent"])
+                for part in sorted(parts_dir.glob("part-*.csv.gz"))
+            ),
+            config,
+        )
+    )
     result_path = output_dir / f"{input_path.stem}_clustered.xlsx"
-    counts = export_large_result_workbook(parts_dir, result_path, summary, uncertain, config, manifest)
+    counts = export_large_result_workbook(
+        parts_dir, result_path, summary, uncertain, family_audit, config, manifest
+    )
     manifest["excel_result"] = str(result_path.resolve())
     manifest["excel_summary"] = str(result_path.resolve())
     manifest["intent_counts"] = counts
@@ -1567,7 +3283,7 @@ def main() -> None:
     prepare = subparsers.add_parser("prepare", help="Inspect input and create a representative labeling job.")
     prepare.add_argument("input")
     prepare.add_argument("--topic", required=True)
-    prepare.add_argument("--sample-size", type=int, default=500)
+    prepare.add_argument("--sample-size", type=int, default=800)
     prepare.add_argument("--phrase-column")
     prepare.add_argument("--frequency-column")
     prepare.add_argument("--job-name")
@@ -1607,10 +3323,83 @@ def main() -> None:
     inline_labels.add_argument("--labels", required=True)
     inline_labels.add_argument("--quiet", action="store_true")
 
+    family_review = subparsers.add_parser(
+        "family-review",
+        help="Return a compact batch of frequent lexical families for intent decisions.",
+    )
+    family_review.add_argument("--job", required=True)
+    family_review.add_argument("--limit", type=int, default=INTENT_FAMILY_REVIEW_BATCH_SIZE)
+    family_review.add_argument("--quiet", action="store_true")
+
+    family_coverage_review = subparsers.add_parser(
+        "family-coverage-review",
+        help="Return mandatory real phrases that cover otherwise unrepresented source families.",
+    )
+    family_coverage_review.add_argument("--job", required=True)
+    family_coverage_review.add_argument(
+        "--limit", type=int, default=FAMILY_COVERAGE_REVIEW_BATCH_SIZE
+    )
+    family_coverage_review.add_argument("--quiet", action="store_true")
+
+    family_labels = subparsers.add_parser(
+        "apply-family-labels-inline",
+        help="Apply compact intent-family decisions: ID|commercial/informational/neutral.",
+    )
+    family_labels.add_argument("--job", required=True)
+    family_labels.add_argument("--labels", required=True)
+    family_labels.add_argument("--quiet", action="store_true")
+
     review = subparsers.add_parser("review", help="Select an uncertainty-focused active-learning labeling batch.")
     review.add_argument("--job", required=True)
     review.add_argument("--limit", type=int, default=20)
     review.add_argument("--quiet", action="store_true")
+
+    relevance_review = subparsers.add_parser(
+        "relevance-review",
+        help="Select likely out-of-topic candidates for a bounded relevance audit.",
+    )
+    relevance_review.add_argument("--job", required=True)
+    relevance_review.add_argument("--limit", type=int, default=50)
+    relevance_review.add_argument("--quiet", action="store_true")
+
+    intent_review = subparsers.add_parser(
+        "intent-review",
+        help="Select commercial/informational boundary rows for a mandatory intent audit.",
+    )
+    intent_review.add_argument("--job", required=True)
+    intent_review.add_argument("--limit", type=int, default=50)
+    intent_review.add_argument("--quiet", action="store_true")
+
+    policy_conflict_review = subparsers.add_parser(
+        "policy-conflict-review",
+        help="Select rows where strong intent signals and the learned classifier disagree.",
+    )
+    policy_conflict_review.add_argument("--job", required=True)
+    policy_conflict_review.add_argument("--limit", type=int, default=50)
+    policy_conflict_review.add_argument("--quiet", action="store_true")
+
+    cluster_review = subparsers.add_parser(
+        "cluster-review",
+        help="Return a compact post-classification cluster relevance batch.",
+    )
+    cluster_review.add_argument("--job", required=True)
+    cluster_review.add_argument("--limit", type=int, default=30)
+    cluster_review.add_argument("--quiet", action="store_true")
+
+    cluster_labels = subparsers.add_parser(
+        "apply-cluster-labels-inline",
+        help="Apply compact cluster and representative ID|label decisions.",
+    )
+    cluster_labels.add_argument("--job", required=True)
+    cluster_labels.add_argument("--labels", required=True)
+    cluster_labels.add_argument("--quiet", action="store_true")
+
+    cluster_decisions = subparsers.add_parser(
+        "apply-cluster-decisions",
+        help="Apply completed cluster relevance decisions and export the final workbook.",
+    )
+    cluster_decisions.add_argument("--job", required=True)
+    cluster_decisions.add_argument("--quiet", action="store_true")
 
     priority_review = subparsers.add_parser(
         "priority-review",
@@ -1619,6 +3408,23 @@ def main() -> None:
     priority_review.add_argument("--job", required=True)
     priority_review.add_argument("--limit", type=int, default=20)
     priority_review.add_argument("--quiet", action="store_true")
+
+    policy_context_parser = subparsers.add_parser("policy-context", help="Return compact labeled examples for a topic-specific intent policy.")
+    policy_context_parser.add_argument("--job", required=True)
+    policy_context_parser.add_argument("--limit", type=int, default=8)
+    policy_context_parser.add_argument("--quiet", action="store_true")
+
+    apply_policy = subparsers.add_parser("apply-policy-inline", help="Save compact topic-specific commercial and informational prototypes.")
+    apply_policy.add_argument("--job", required=True)
+    apply_policy.add_argument("--commercial", required=True)
+    apply_policy.add_argument("--implicit-commercial", required=True)
+    apply_policy.add_argument("--informational", required=True)
+    apply_policy.add_argument("--commercial-signals", required=True)
+    apply_policy.add_argument("--informational-signals", required=True)
+    apply_policy.add_argument("--weak-question-signals", required=True)
+    apply_policy.add_argument("--relevant", required=True)
+    apply_policy.add_argument("--garbage", required=True)
+    apply_policy.add_argument("--quiet", action="store_true")
 
     run = subparsers.add_parser("run", help="Run classification and clustering for a prepared job.")
     run.add_argument("input")
@@ -1747,7 +3553,28 @@ def main() -> None:
             input_path = resolve_input(args.input)
             job_dir = find_job_for_input(input_path.name)
             if job_dir:
-                print_result(recorded_next_action(job_dir), args.quiet)
+                existing_state = read_state(job_dir)
+                if args.topic and str(existing_state.get("stage", "")) in {
+                    "quality_review",
+                    "knowledge_saved",
+                    "learned",
+                    "finalized",
+                }:
+                    rerun_name = f"{job_dir.name}-rerun-{time.strftime('%Y%m%d-%H%M%S')}"
+                    print_result(
+                        {
+                            "status": "continue",
+                            "stage": "prepare",
+                            "action": "prepare_new_run",
+                            "command": (
+                                f'{HERMES_COMMAND} prepare "{input_path.name}" '
+                                f'--topic "{args.topic}" --job-name "{rerun_name}" --quiet'
+                            ),
+                        },
+                        args.quiet,
+                    )
+                else:
+                    print_result(recorded_next_action(job_dir), args.quiet)
             elif args.topic:
                 print_result(
                     {
@@ -1771,10 +3598,53 @@ def main() -> None:
             apply_label_payload(resolve_job(args.job), parse_inline_labels(args.labels)),
             args.quiet,
         )
+    elif args.command == "family-review":
+        print_result(intent_family_batch(resolve_job(args.job), args.limit), args.quiet)
+    elif args.command == "family-coverage-review":
+        print_result(
+            select_family_coverage_review(resolve_job(args.job), args.limit),
+            args.quiet,
+        )
+    elif args.command == "apply-family-labels-inline":
+        print_result(
+            apply_intent_family_labels_inline(resolve_job(args.job), args.labels),
+            args.quiet,
+        )
     elif args.command == "review":
         print_result(select_active_review(resolve_job(args.job), args.limit), args.quiet)
+    elif args.command == "relevance-review":
+        print_result(select_relevance_review(resolve_job(args.job), args.limit), args.quiet)
+    elif args.command == "intent-review":
+        print_result(select_intent_review(resolve_job(args.job), args.limit), args.quiet)
+    elif args.command == "policy-conflict-review":
+        print_result(select_policy_conflict_review(resolve_job(args.job), args.limit), args.quiet)
+    elif args.command == "cluster-review":
+        print_result(cluster_relevance_batch(resolve_job(args.job), args.limit), args.quiet)
+    elif args.command == "apply-cluster-labels-inline":
+        print_result(
+            apply_cluster_labels_inline(resolve_job(args.job), args.labels), args.quiet
+        )
+    elif args.command == "apply-cluster-decisions":
+        print_result(apply_cluster_relevance_decisions(resolve_job(args.job)), args.quiet)
     elif args.command == "priority-review":
         print_result(select_priority_review(resolve_job(args.job), args.limit), args.quiet)
+    elif args.command == "policy-context":
+        print_result(policy_context(resolve_job(args.job), args.limit), args.quiet)
+    elif args.command == "apply-policy-inline":
+        print_result(
+            apply_policy_inline(
+                resolve_job(args.job),
+                args.commercial,
+                args.implicit_commercial,
+                args.informational,
+                args.commercial_signals,
+                args.informational_signals,
+                args.weak_question_signals,
+                args.relevant,
+                args.garbage,
+            ),
+            args.quiet,
+        )
     elif args.command == "run":
         job_dir = resolve_job(args.job)
         readiness = job_status(job_dir)

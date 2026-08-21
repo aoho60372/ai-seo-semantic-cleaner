@@ -15,15 +15,23 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_DIR = PROJECT_DIR.parent / "models" / "multilingual-e5-small"
-LEGACY_MODEL_NAMES = {"intfloat/multilingual-e5-small", "local:multilingual-e5-small"}
+MODELS_DIR = PROJECT_DIR.parent / "models"
+DEFAULT_MODEL_NAME = "local:multilingual-e5-base"
+MODEL_ALIASES = {
+    "local:multilingual-e5-small": MODELS_DIR / "multilingual-e5-small",
+    "intfloat/multilingual-e5-small": MODELS_DIR / "multilingual-e5-small",
+    "multilingual-e5-small": MODELS_DIR / "multilingual-e5-small",
+    "local:multilingual-e5-base": MODELS_DIR / "multilingual-e5-base",
+    "intfloat/multilingual-e5-base": MODELS_DIR / "multilingual-e5-base",
+    "multilingual-e5-base": MODELS_DIR / "multilingual-e5-base",
+}
 REQUIRED_MODEL_FILES = ("config.json", "modules.json", "model.safetensors", "tokenizer.json")
 
 
 def resolve_local_model(value: str | None = None) -> Path:
     """Return the supported local model directory and validate it early."""
-    raw = str(value or "local:multilingual-e5-small").strip()
-    candidate = DEFAULT_MODEL_DIR if raw in LEGACY_MODEL_NAMES else Path(raw)
+    raw = str(value or DEFAULT_MODEL_NAME).strip()
+    candidate = MODEL_ALIASES.get(raw, Path(raw))
     if not candidate.is_absolute():
         candidate = (PROJECT_DIR / candidate).resolve()
     missing = [name for name in REQUIRED_MODEL_FILES if not (candidate / name).is_file()]
@@ -31,7 +39,7 @@ def resolve_local_model(value: str | None = None) -> Path:
         raise FileNotFoundError(
             "Local embedding model is incomplete: "
             f"{candidate}. Missing: {', '.join(missing)}. "
-            "Place multilingual-e5-small in ../models/multilingual-e5-small."
+            "Place the selected model in ../models or provide an absolute local path."
         )
     return candidate
 
@@ -56,7 +64,7 @@ def load_local_embedding_model(config: dict[str, Any]) -> tuple[Any, str, Path]:
     """Load E5 from disk only and report the actual compute device."""
     from sentence_transformers import SentenceTransformer
 
-    model_dir = resolve_local_model(str(config.get("embedding_model", "local:multilingual-e5-small")))
+    model_dir = resolve_local_model(str(config.get("embedding_model", DEFAULT_MODEL_NAME)))
     device = choose_device(str(config.get("embedding_device", "auto")))
     return SentenceTransformer(str(model_dir), device=device, local_files_only=True), device, model_dir
 

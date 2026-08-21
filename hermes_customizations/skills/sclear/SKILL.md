@@ -24,7 +24,7 @@ Example: /sclear semantic.xlsx Продажа автозапчастей
 Otherwise run exactly:
 
 ```text
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ".\seo.ps1" next --input "<file>" --topic "<topic>" --quiet
+"./.venv/Scripts/python.exe" "./seo_workflow.py" next --input "<file>" --topic "<topic>" --quiet
 ```
 
 The workflow validates that the input file exists. If it returns an error,
